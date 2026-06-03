@@ -1,0 +1,19 @@
+# Secrets — .envrc carries API_KEY / EXA_API_KEY etc.
+.envrc
+.env
+.env.*
+
+# Build artifacts
+/target/
+
+# Agent demo output
+/examples/hello.*
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Logs & scratch
+*.log

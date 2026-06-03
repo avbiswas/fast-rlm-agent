@@ -1,0 +1,38 @@
+[package]
+name = "fast-rlm-agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Terminal rendering + backend/input
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# Async runtime + stream adapters for crossterm's EventStream
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "process",
+    "fs",
+] }
+futures = "0.3"
+
+# Markdown + syntax highlighting (Codex-style render stack)
+pulldown-cmark = { version = "0.12", default-features = false }
+syntect = "5"
+two-face = "0.4"
+
+# Pretty line diffs for the file-edit approval UI
+similar = "2"
+
+# HTTP client for the model API (SSE streaming) and the Exa web-search API
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTML → Markdown conversion for the fetch tool (token-efficient page content)
+htmd = "0.2"
+
+anyhow = "1"
