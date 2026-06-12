@@ -1,6 +1,9 @@
 //! Application state and the central `update` reducer.
 
-use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
+    MouseEventKind,
+};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
@@ -8,10 +11,13 @@ use crate::agent::{self, AgentEvent};
 use crate::composer::Composer;
 use crate::config::Config;
 use crate::event::Event;
+use crate::session;
+use crate::snapshot::Snapshotter;
 use crate::tools::{self, Question, Responder, ToolCall, ToolResult, ToolStatus, ToolUpdate};
 
 /// One entry in the conversation transcript — the single vertical "stack"
-/// everything renders into.
+/// everything renders into. Serializable so sessions can be saved/resumed.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum Item {
     User(String),
     Assistant(String),
@@ -21,6 +27,7 @@ pub enum Item {
 }
 
 /// A tool call's record in the transcript.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolRun {
     pub id: u64,
     /// e.g. "Bash", "Read", "Update", "Search".
@@ -34,6 +41,7 @@ pub struct ToolRun {
 }
 
 /// How a tool's output area renders.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum ToolBody {
     /// A file write: render a diff of `old` → `new`.
     Diff { path: String, old: String, new: String },
@@ -51,6 +59,15 @@ pub enum Mode {
         responder: Responder,
     },
     Question(QuestionModal),
+    /// The `/resume` session picker.
+    Resume(ResumePicker),
+    /// The `/undo` checkpoint picker.
+    UndoPicker { cursor: usize },
+}
+
+pub struct ResumePicker {
+    pub sessions: Vec<session::Summary>,
+    pub cursor: usize,
 }
 
 pub struct QuestionModal {
@@ -77,6 +94,11 @@ pub struct App {
     task: Option<JoinHandle<()>>,
     /// Append-only conversation history (see `agent` docs on cache discipline).
     history: agent::SharedHistory,
+    /// Set once the first real message is sent; identifies the session file.
+    session_id: Option<String>,
+    session_created: u64,
+    /// Shadow-git snapshotter for /undo. None when git is unavailable.
+    pub snapshotter: Option<Snapshotter>,
     tx: UnboundedSender<Event>,
 }
 
@@ -97,6 +119,11 @@ impl App {
             next_id: 0,
             task: None,
             history: agent::new_session(),
+            session_id: None,
+            session_created: 0,
+            snapshotter: Snapshotter::new(
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            ),
             tx,
         }
     }
@@ -125,6 +152,17 @@ impl App {
                     self.composer.insert_str(&text);
                 }
             }
+            CrosstermEvent::Mouse(mouse) => self.on_mouse(mouse),
+            _ => {}
+        }
+    }
+
+    /// Wheel scrolling works in every mode — the transcript is always the
+    /// thing behind the pointer.
+    fn on_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_by(-3),
+            MouseEventKind::ScrollDown => self.scroll_by(3),
             _ => {}
         }
     }
@@ -138,7 +176,32 @@ impl App {
             Mode::Chat => self.on_key_chat(key),
             Mode::Approve { .. } => self.on_key_approve(key),
             Mode::Question(_) => self.on_key_question(key),
+            Mode::Resume(_) => self.on_key_resume(key),
+            Mode::UndoPicker { .. } => self.on_key_undo_picker(key),
         }
+    }
+
+    fn on_key_resume(&mut self, key: KeyEvent) {
+        let Mode::Resume(picker) = &mut self.mode else {
+            return;
+        };
+        let n = picker.sessions.len();
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Chat,
+            KeyCode::Up => picker.cursor = picker.cursor.saturating_sub(1),
+            KeyCode::Down => picker.cursor = (picker.cursor + 1).min(n.saturating_sub(1)),
+            KeyCode::Enter => {
+                let Mode::Resume(picker) = std::mem::replace(&mut self.mode, Mode::Chat) else {
+                    return;
+                };
+                if let Some(summary) = picker.sessions.get(picker.cursor) {
+                    let path = summary.path.clone();
+                    self.resume_session(&path);
+                }
+            }
+            _ => {}
+        }
+        self.dirty = true;
     }
 
     fn on_key_chat(&mut self, key: KeyEvent) {
@@ -236,6 +299,23 @@ impl App {
         let prompt = self.composer.text().trim().to_string();
         self.composer.clear();
 
+        // Slash commands are handled by the harness, not the model.
+        if let Some(command) = prompt.strip_prefix('/') {
+            self.handle_command(command.trim());
+            return;
+        }
+
+        // First real message starts the session file.
+        if self.session_id.is_none() {
+            self.session_id = Some(session::new_id());
+            self.session_created = session::now();
+        }
+
+        // Snapshot filesystem state before the agent touches anything.
+        if let Some(ref mut snap) = self.snapshotter {
+            snap.capture(self.items.len(), self.history.lock().unwrap().len());
+        }
+
         self.items.push(Item::User(prompt.clone()));
         self.streaming = true;
         self.assistant_open = false;
@@ -248,6 +328,76 @@ impl App {
         ));
     }
 
+    // ---- slash commands & sessions ----------------------------------------
+
+    fn handle_command(&mut self, command: &str) {
+        match command {
+            "resume" => {
+                let sessions = session::list_in(&session::default_dir());
+                if sessions.is_empty() {
+                    self.note("no saved sessions yet".to_string());
+                } else {
+                    self.mode = Mode::Resume(ResumePicker {
+                        sessions,
+                        cursor: 0,
+                    });
+                }
+            }
+            "undo" => self.open_undo_picker(),
+            other => self.note(format!("unknown command: /{other}")),
+        }
+        self.pin();
+    }
+
+    /// Persist the current session (no-op until a first message exists).
+    pub fn save_session(&self) {
+        let Some(id) = &self.session_id else {
+            return;
+        };
+        let title = self
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::User(text) => Some(text.lines().next().unwrap_or("").to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "(untitled)".to_string());
+        let title = title.chars().take(64).collect();
+
+        let saved = session::SavedSession {
+            id: id.clone(),
+            title,
+            cwd: std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            created_at: self.session_created,
+            updated_at: session::now(),
+            history: self.history.lock().unwrap().clone(),
+            items: self.items.clone(),
+        };
+        let _ = session::save_in(&session::default_dir(), &saved);
+    }
+
+    fn resume_session(&mut self, path: &std::path::Path) {
+        match session::load(path) {
+            Ok(loaded) => {
+                // Don't lose the conversation we're leaving.
+                self.save_session();
+
+                self.items = loaded.items;
+                *self.history.lock().unwrap() = loaded.history;
+                self.session_id = Some(loaded.id);
+                self.session_created = loaded.created_at;
+                self.usage = None;
+                self.assistant_open = false;
+                self.follow = true;
+                self.note(format!("⟲ resumed: {}", loaded.title));
+            }
+            Err(e) => self.note(format!("failed to load session: {e}")),
+        }
+        self.pin();
+    }
+
     fn cancel(&mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
@@ -256,6 +406,58 @@ impl App {
         self.streaming = false;
         self.assistant_open = false;
         self.note("⚠ cancelled".to_string());
+        self.save_session();
+    }
+
+    fn open_undo_picker(&mut self) {
+        let count = self.snapshotter.as_ref().map(|s| s.checkpoints().len()).unwrap_or(0);
+        if count == 0 {
+            self.note(if self.snapshotter.is_none() {
+                "⚠ /undo not available — git not found".to_string()
+            } else {
+                "nothing to undo".to_string()
+            });
+            self.pin();
+            return;
+        }
+        self.mode = Mode::UndoPicker { cursor: 0 };
+        self.dirty = true;
+    }
+
+    fn on_key_undo_picker(&mut self, key: KeyEvent) {
+        let Mode::UndoPicker { cursor } = self.mode else { return; };
+        let count = self.snapshotter.as_ref().map(|s| s.checkpoints().len()).unwrap_or(0);
+
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Chat,
+            KeyCode::Up => self.mode = Mode::UndoPicker { cursor: cursor.saturating_sub(1) },
+            KeyCode::Down => {
+                self.mode = Mode::UndoPicker { cursor: (cursor + 1).min(count.saturating_sub(1)) };
+            }
+            KeyCode::Enter => {
+                self.mode = Mode::Chat;
+                // Picker shows newest first: cursor 0 = checkpoints[count-1].
+                let stack_idx = count.saturating_sub(1 + cursor);
+                self.restore_to_checkpoint(stack_idx);
+            }
+            _ => {}
+        }
+        self.dirty = true;
+    }
+
+    fn restore_to_checkpoint(&mut self, stack_idx: usize) {
+        let Some(ref mut snap) = self.snapshotter else { return; };
+        match snap.restore_to(stack_idx) {
+            None => self.note("⚠ undo failed — could not restore snapshot".to_string()),
+            Some(cp) => {
+                self.items.truncate(cp.items_len);
+                self.history.lock().unwrap().truncate(cp.history_len);
+                self.assistant_open = false;
+                self.follow = true;
+                self.note("⟲ undone — files and conversation restored".to_string());
+            }
+        }
+        self.pin();
     }
 
     // ---- agent events ----------------------------------------------------
@@ -272,6 +474,7 @@ impl App {
                 self.streaming = false;
                 self.assistant_open = false;
                 self.task = None;
+                self.save_session();
             }
         }
     }

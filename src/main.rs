@@ -18,6 +18,8 @@ mod config;
 mod event;
 mod llm;
 mod markdown;
+mod session;
+mod snapshot;
 mod tools;
 mod ui;
 
@@ -25,7 +27,9 @@ use std::io::{self, Stdout};
 
 use anyhow::Result;
 use crossterm::{
-    event::{DisableBracketedPaste, EnableBracketedPaste},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -66,6 +70,7 @@ async fn run(terminal: &mut Tui) -> Result<()> {
         };
 
         if app.should_quit {
+            app.save_session();
             break;
         }
         if needs_redraw {
@@ -79,14 +84,24 @@ async fn run(terminal: &mut Tui) -> Result<()> {
 fn init_terminal() -> Result<Tui> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     Ok(terminal)
 }
 
 fn restore_terminal() -> Result<()> {
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste)?;
+    execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        DisableBracketedPaste,
+        DisableMouseCapture
+    )?;
     Ok(())
 }
 

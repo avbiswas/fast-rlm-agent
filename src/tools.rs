@@ -88,7 +88,7 @@ pub enum ToolResult {
 pub type Responder = oneshot::Sender<ToolResult>;
 
 /// Lifecycle of a tool call as shown in the transcript.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ToolStatus {
     Pending,  // awaiting approval
     Running,  // executing

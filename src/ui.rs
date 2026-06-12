@@ -12,8 +12,10 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, Item, Mode, QuestionModal, ToolBody, ToolRun};
+use crate::app::{App, Item, Mode, QuestionModal, ResumePicker, ToolBody, ToolRun};
+use crate::snapshot::Checkpoint;
 use crate::markdown;
+use crate::session;
 use crate::tools::ToolStatus;
 
 const ACCENT: Color = Color::Rgb(136, 192, 208);
@@ -38,8 +40,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_transcript(frame, app, chunks[0]);
     draw_input(frame, app, chunks[1]);
 
-    if let Mode::Question(modal) = &app.mode {
-        draw_question(frame, modal);
+    match &app.mode {
+        Mode::Question(modal) => draw_question(frame, modal),
+        Mode::Resume(picker) => draw_resume(frame, picker),
+        Mode::UndoPicker { cursor } => draw_undo_picker(frame, app, *cursor),
+        _ => {}
     }
 }
 
@@ -131,6 +136,14 @@ fn build_transcript(app: &App) -> Text<'static> {
             )),
             Line::from(Span::styled(
                 "  (Alt+Enter = newline · Enter = send · Esc = quit/cancel)",
+                Style::default().fg(DIM),
+            )),
+            Line::from(Span::styled(
+                "  /resume — load a past session",
+                Style::default().fg(DIM),
+            )),
+            Line::from(Span::styled(
+                "  /undo   — restore files and conversation to before the last turn",
                 Style::default().fg(DIM),
             )),
         ]);
@@ -368,8 +381,10 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     let (hint, color) = match app.mode {
         Mode::Approve { .. } => ("awaiting approval — y / n", YELLOW),
         Mode::Question(_) => ("answer the question above", YELLOW),
+        Mode::Resume(_) => ("pick a session above", YELLOW),
+        Mode::UndoPicker { .. } => ("pick a checkpoint to restore", YELLOW),
         Mode::Chat if app.streaming => ("working… Esc cancels", DIM),
-        Mode::Chat => ("Enter send · Alt+Enter newline · Esc quit", DIM),
+        Mode::Chat => ("Enter send · Alt+Enter newline · /resume · /undo · Esc quit", DIM),
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -392,6 +407,139 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         let x = inner.x + (cur_col as u16).saturating_sub(scroll_x);
         let y = inner.y + (cur_row as u16).saturating_sub(scroll_y);
         frame.set_cursor_position((x, y));
+    }
+}
+
+// ---- resume picker ---------------------------------------------------------
+
+fn draw_resume(frame: &mut Frame, picker: &ResumePicker) {
+    let area = centered(frame.area(), 70, 60);
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" ⟲ resume session ")
+        .title_bottom(
+            Line::from(Span::styled(
+                " ↑/↓ move   enter load   esc cancel ",
+                Style::default().fg(DIM),
+            ))
+            .centered(),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let now = session::now();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, s) in picker.sessions.iter().enumerate() {
+        let active = i == picker.cursor;
+        let pointer = if active { "▶ " } else { "  " };
+        let title_style = if active {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(pointer.to_string(), Style::default().fg(ACCENT)),
+            Span::styled(s.title.clone(), title_style),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "    {} · {} turn{}",
+                fmt_age(now.saturating_sub(s.updated_at)),
+                s.turns,
+                if s.turns == 1 { "" } else { "s" },
+            ),
+            Style::default().fg(DIM),
+        )));
+    }
+
+    // Keep the selection in view when the list is long.
+    let scroll = (picker.cursor as u16 * 2).saturating_sub(inner.height.saturating_sub(2));
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).scroll((scroll, 0)),
+        inner,
+    );
+}
+
+/// 42 → "just now", 300 → "5m ago", 7200 → "2h ago", 200000 → "2d ago".
+fn fmt_age(secs: u64) -> String {
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86400),
+    }
+}
+
+// ---- undo picker ---------------------------------------------------------
+
+fn draw_undo_picker(frame: &mut Frame, app: &App, cursor: usize) {
+    let snap = match &app.snapshotter {
+        Some(s) => s,
+        None => return,
+    };
+    let checkpoints = snap.checkpoints();
+    if checkpoints.is_empty() { return; }
+
+    let area = centered(frame.area(), 70, 60);
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" ⟲ restore to checkpoint ")
+        .title_bottom(
+            Line::from(Span::styled(
+                " ↑/↓ move   enter restore   esc cancel ",
+                Style::default().fg(DIM),
+            ))
+            .centered(),
+        );
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let n = checkpoints.len();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Newest checkpoint first.
+    for (picker_idx, cp) in checkpoints.iter().rev().enumerate() {
+        let active = picker_idx == cursor;
+        let pointer = if active { "▶ " } else { "  " };
+        let turn = n - picker_idx; // 1-indexed turn number from oldest
+
+        let label = checkpoint_label(cp, &app.items);
+        let title_style = if active {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(pointer.to_string(), Style::default().fg(ACCENT)),
+            Span::styled(format!("Turn {turn}  "), Style::default().fg(DIM)),
+            Span::styled(label, title_style),
+        ]));
+    }
+
+    let scroll = (cursor as u16).saturating_sub(inner.height.saturating_sub(1));
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).scroll((scroll, 0)),
+        inner,
+    );
+}
+
+/// First line of the user message that started the turn this checkpoint precedes.
+fn checkpoint_label(cp: &Checkpoint, items: &[Item]) -> String {
+    match items.get(cp.items_len) {
+        Some(Item::User(text)) => text
+            .lines()
+            .next()
+            .unwrap_or("(empty)")
+            .chars()
+            .take(60)
+            .collect(),
+        _ => "(start of session)".to_string(),
     }
 }
 
