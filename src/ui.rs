@@ -71,7 +71,7 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
 
     let text = build_transcript(app);
-    let total = text.lines.len() as u16;
+    let total = visual_row_count(&text, inner.width);
     let viewport = inner.height;
     let max_scroll = total.saturating_sub(viewport);
 
@@ -104,6 +104,22 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
             &mut state,
         );
     }
+}
+
+/// Total visual rows a `Text` occupies when wrapped to `width` columns.
+/// `Paragraph::scroll` counts visual rows, not logical lines, so we must
+/// use this instead of `text.lines.len()` when computing max scroll.
+fn visual_row_count(text: &Text<'_>, width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    text.lines
+        .iter()
+        .map(|line| {
+            let w = line.width() as u16;
+            if w <= width { 1 } else { w.div_ceil(width) }
+        })
+        .sum()
 }
 
 fn build_transcript(app: &App) -> Text<'static> {
