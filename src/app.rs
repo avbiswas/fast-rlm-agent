@@ -1,9 +1,6 @@
 //! Application state and the central `update` reducer.
 
-use crossterm::event::{
-    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
-    MouseEventKind,
-};
+use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::path::PathBuf;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
@@ -17,6 +14,8 @@ use crate::session;
 use crate::snapshot::Snapshotter;
 use crate::tools::{self, Question, Responder, ToolCall, ToolResult, ToolStatus, ToolUpdate};
 
+const PROCESSING_NOTE: &str = "Processing...";
+
 /// One entry in the conversation transcript — the single vertical "stack"
 /// everything renders into. Serializable so sessions can be saved/resumed.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -26,6 +25,8 @@ pub enum Item {
     Note(String),
     /// A tool call, rendered uniformly as `● Verb(args)` + `⎿ output`.
     Tool(ToolRun),
+    /// One generated-code / REPL-execution step from FastRLM.
+    Rlm(agent::RlmStep),
 }
 
 /// A tool call's record in the transcript.
@@ -95,8 +96,10 @@ pub struct App {
     pub streaming: bool,
     pub should_quit: bool,
     pub dirty: bool,
+    /// Items before this index have been written into terminal scrollback.
+    pub committed_items: usize,
     /// Token accounting from the most recent model request.
-    pub usage: Option<crate::llm::Usage>,
+    pub usage: Option<agent::Usage>,
     assistant_open: bool,
     next_id: u64,
     task: Option<JoinHandle<()>>,
@@ -128,6 +131,7 @@ impl App {
             streaming: false,
             should_quit: false,
             dirty: false,
+            committed_items: 0,
             usage: None,
             assistant_open: false,
             next_id: 0,
@@ -165,17 +169,6 @@ impl App {
                     self.composer.insert_str(&text);
                 }
             }
-            CrosstermEvent::Mouse(mouse) => self.on_mouse(mouse),
-            _ => {}
-        }
-    }
-
-    /// Wheel scrolling works in every mode — the transcript is always the
-    /// thing behind the pointer.
-    fn on_mouse(&mut self, mouse: MouseEvent) {
-        match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_by(-3),
-            MouseEventKind::ScrollDown => self.scroll_by(3),
             _ => {}
         }
     }
@@ -334,10 +327,22 @@ impl App {
         self.assistant_open = false;
         self.follow = true;
         let context = PromptContext::from_prompt(prompt, &self.workspace_root);
+        if !context.links.is_empty() || !context.files.is_empty() {
+            self.items.push(Item::Note(format!(
+                "◇ structured context · {} link{} · {} file{}",
+                context.links.len(),
+                if context.links.len() == 1 { "" } else { "s" },
+                context.files.len(),
+                if context.files.len() == 1 { "" } else { "s" },
+            )));
+        }
+        let session_id = self.session_id.clone().unwrap_or_else(session::new_id);
         self.task = Some(agent::respond(
             context,
             self.config.clone(),
             self.history.clone(),
+            self.workspace_root.clone(),
+            session_id,
             self.tx.clone(),
         ));
     }
@@ -399,6 +404,7 @@ impl App {
                 self.save_session();
 
                 self.items = loaded.items;
+                self.committed_items = 0;
                 *self.history.lock().unwrap() = loaded.history;
                 self.session_id = Some(loaded.id);
                 self.session_created = loaded.created_at;
@@ -483,6 +489,7 @@ impl App {
             None => self.note("⚠ undo failed — could not restore snapshot".to_string()),
             Some(cp) => {
                 self.items.truncate(cp.items_len);
+                self.committed_items = self.committed_items.min(self.items.len());
                 self.history.lock().unwrap().truncate(cp.history_len);
                 self.assistant_open = false;
                 self.follow = true;
@@ -496,12 +503,46 @@ impl App {
 
     fn on_agent(&mut self, msg: AgentEvent) {
         match msg {
-            AgentEvent::Delta(text) => self.push_delta(&text),
-            AgentEvent::Tool { call, respond } => self.open_tool(call, respond),
+            AgentEvent::Step(step) => {
+                self.usage = Some(step.total_usage);
+                if step.depth == 0 && step.step == 0 {
+                    let already_shown = self
+                        .items
+                        .iter()
+                        .rev()
+                        .take_while(|item| !matches!(item, Item::User(_)))
+                        .any(|item| matches!(item, Item::Note(text) if text == PROCESSING_NOTE));
+                    if !already_shown {
+                        self.note(PROCESSING_NOTE.to_string());
+                    } else {
+                        self.pin();
+                    }
+                    return;
+                }
+                self.items.push(Item::Rlm(*step));
+                self.assistant_open = false;
+                self.pin();
+            }
+            AgentEvent::Tool(call, responder) => self.open_tool(call, responder),
+            AgentEvent::Final { depth, result } => {
+                let text = match result {
+                    serde_json::Value::String(text) => text,
+                    other => format!(
+                        "```json\n{}\n```",
+                        serde_json::to_string_pretty(&other).unwrap_or_else(|_| other.to_string())
+                    ),
+                };
+                if depth == 0 {
+                    self.push_delta(&text);
+                } else {
+                    self.note(format!("↳ depth {depth} sub-agent returned a result"));
+                }
+            }
             AgentEvent::Usage(usage) => {
                 self.usage = Some(usage);
                 self.dirty = true;
             }
+            AgentEvent::Error(error) => self.note(format!("⚠ FastRLM: {error}")),
             AgentEvent::Done => {
                 self.streaming = false;
                 self.assistant_open = false;
@@ -719,6 +760,22 @@ impl App {
             self.dirty = true;
         }
     }
+
+    /// Return the longest prefix whose rendering can no longer change. The
+    /// main loop moves this prefix into native terminal scrollback.
+    pub fn committable_items_end(&self) -> usize {
+        self.items
+            .iter()
+            .enumerate()
+            .skip(self.committed_items)
+            .take_while(|(index, item)| match item {
+                Item::Tool(run) => !matches!(run.status, ToolStatus::Pending | ToolStatus::Running),
+                Item::Assistant(_) => !(self.assistant_open && *index + 1 == self.items.len()),
+                _ => true,
+            })
+            .last()
+            .map_or(self.committed_items, |(index, _)| index + 1)
+    }
 }
 
 /// Build the transcript header bits (verb, arg, body) for a tool call.
@@ -772,6 +829,7 @@ fn describe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::{mpsc, oneshot};
 
     #[test]
     fn write_preview_rejects_paths_outside_workspace() {
@@ -786,5 +844,111 @@ mod tests {
             panic!("outside path unexpectedly produced an approval preview");
         };
         assert!(error.contains("path escapes workspace"));
+    }
+
+    #[test]
+    fn fast_rlm_write_request_opens_the_approval_ui() {
+        let root = std::env::temp_dir().join(format!("fra-approval-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(event_tx, Config::from_env());
+        app.workspace_root = root.clone();
+        let (reply_tx, _reply_rx) = oneshot::channel();
+
+        app.on_agent(AgentEvent::Tool(
+            ToolCall::Write {
+                path: "proof.txt".to_string(),
+                content: "new content\n".to_string(),
+            },
+            reply_tx,
+        ));
+
+        assert!(matches!(app.mode, Mode::Approve { .. }));
+        assert!(matches!(
+            app.items.last(),
+            Some(Item::Tool(ToolRun {
+                status: ToolStatus::Pending,
+                ..
+            }))
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn only_finalized_items_are_committable_to_terminal_scrollback() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(event_tx, Config::from_env());
+        app.items.push(Item::User("change it".to_string()));
+        app.items.push(Item::Tool(ToolRun {
+            id: 0,
+            verb: "Edit".to_string(),
+            arg: "file.txt".to_string(),
+            body: ToolBody::Text { output: None },
+            status: ToolStatus::Pending,
+            summary: None,
+        }));
+        app.items.push(Item::Rlm(agent::RlmStep {
+            run_id: "root".to_string(),
+            parent_run_id: None,
+            depth: 0,
+            step: 1,
+            event_type: "execution_result".to_string(),
+            code: String::new(),
+            output: None,
+            has_error: false,
+            reasoning: None,
+            usage: Default::default(),
+            total_usage: Default::default(),
+        }));
+
+        assert_eq!(app.committable_items_end(), 1);
+        if let Item::Tool(run) = &mut app.items[1] {
+            run.status = ToolStatus::Done;
+        }
+        assert_eq!(app.committable_items_end(), 3);
+
+        app.items.push(Item::Assistant("final".to_string()));
+        app.assistant_open = true;
+        assert_eq!(app.committable_items_end(), 3);
+        app.assistant_open = false;
+        assert_eq!(app.committable_items_end(), 4);
+    }
+
+    #[test]
+    fn root_bootstrap_events_collapse_to_one_processing_note() {
+        fn step(step: usize, event_type: &str) -> agent::RlmStep {
+            agent::RlmStep {
+                run_id: "root".to_string(),
+                parent_run_id: None,
+                depth: 0,
+                step,
+                event_type: event_type.to_string(),
+                code: "print(context)".to_string(),
+                output: None,
+                has_error: false,
+                reasoning: None,
+                usage: Default::default(),
+                total_usage: Default::default(),
+            }
+        }
+
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(event_tx, Config::from_env());
+        app.items.push(Item::User("hello".to_string()));
+
+        app.on_agent(AgentEvent::Step(Box::new(step(0, "code_generated"))));
+        app.on_agent(AgentEvent::Step(Box::new(step(0, "execution_result"))));
+
+        assert_eq!(
+            app.items
+                .iter()
+                .filter(|item| matches!(item, Item::Note(text) if text == PROCESSING_NOTE))
+                .count(),
+            1
+        );
+        assert!(!app.items.iter().any(|item| matches!(item, Item::Rlm(_))));
+
+        app.on_agent(AgentEvent::Step(Box::new(step(1, "execution_result"))));
+        assert!(matches!(app.items.last(), Some(Item::Rlm(step)) if step.step == 1));
     }
 }

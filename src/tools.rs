@@ -15,6 +15,7 @@ use tokio::sync::oneshot;
 use crate::workspace;
 
 /// A request from the agent for the harness to run a tool.
+#[allow(dead_code)] // Web and question tools are not bridged in the first slice.
 pub enum ToolCall {
     /// Read a file and return its contents to the agent.
     Read { path: String },
@@ -61,6 +62,7 @@ impl ToolCall {
 pub enum FetchFormat {
     #[default]
     Markdown,
+    #[allow(dead_code)]
     Text,
 }
 
@@ -86,7 +88,10 @@ pub enum ToolResult {
     /// Generic command-style result: `text` is what the model sees.
     Output { ok: bool, text: String },
     /// Indices into `Question::options` that the user selected.
-    Question { selected: Vec<usize> },
+    Question {
+        #[allow(dead_code)]
+        selected: Vec<usize>,
+    },
 }
 
 pub type Responder = oneshot::Sender<ToolResult>;

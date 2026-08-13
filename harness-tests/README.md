@@ -1,6 +1,8 @@
 # Harness test cases
 
-These cases are small coding tasks for demos and manual quality checks. Each
+These cases are small coding fixtures and manual quality checks. FastRLM can
+change their isolated workspaces through the harness's reviewed MCP tools. See
+`demo/PROMPT.md` for the current end-to-end launch demo. Each
 case contains:
 
 - a task copied into the workspace as `TASK.md`;
@@ -14,7 +16,7 @@ List the available cases:
 ./harness-tests/run.sh list
 ```
 
-Run a case interactively:
+Run a coding case interactively:
 
 ```sh
 ./harness-tests/run.sh run fix-discount

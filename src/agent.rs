@@ -1,75 +1,162 @@
-//! The agent: a real model-driven tool loop.
+//! FastRLM process bridge and live event adapter.
 //!
-//! Each user message starts a turn: we stream a completion from the model
-//! (`llm::stream_chat`); if it requests tools, we dispatch them through the
-//! harness — which renders them, gates destructive ones behind approval, and
-//! executes — then feed the results back and loop until the model answers
-//! with plain text (or we hit the round cap).
-//!
-//! ## History & KV-cache discipline
-//!
-//! The session history is shared (`SharedHistory`) and **append-only**: the
-//! system prompt is computed once, nothing is ever rewritten or dropped, and
-//! assistant turns are stored as the **raw message object from the API,
-//! verbatim** — content, tool_calls, reasoning, and any provider-specific
-//! fields we've never heard of. We never reconstruct messages from parsed
-//! fields. Every request is therefore a byte-stable prefix extension of the
-//! previous one — exactly what provider prompt/KV caches need to hit.
-//!
-//! Commits are *round-complete*: a model turn and all of its tool results are
-//! appended together, only after the tools finish. A cancelled turn can never
-//! leave a dangling `tool_calls` without matching `tool` replies (which
-//! providers reject) — the partial round is simply dropped.
+//! Each user turn is passed to FastRLM as a real structured dictionary. The
+//! Python runner owns the recursive REPL/session; this module reads its NDJSON
+//! event stream and translates it into reducer-friendly `AgentEvent`s.
 
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{mpsc::UnboundedSender, oneshot};
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::context::PromptContext;
 use crate::event::Event;
-use crate::llm::{self, AssistantToolCall, Message};
-use crate::tools::{Choice, FetchFormat, Question, ToolCall, ToolResult};
+use crate::tools::{Responder, ToolCall};
 
-/// Hard cap on model⇄tool rounds per user message.
-const MAX_ROUNDS: usize = 16;
+const BRIDGE_SOURCE: &str = include_str!("../scripts/fast_rlm_bridge.py");
+const WORKSPACE_MCP_SOURCE: &str = include_str!("../scripts/workspace_mcp.ts");
 
-/// The append-only conversation history, shared between the app (owner) and
-/// in-flight agent tasks (appenders).
+/// Lightweight UI transcript persisted alongside the FastRLM session. FastRLM
+/// owns its full model/REPL history in `rlm-sessions`; these values only let the
+/// terminal restore the visible conversation.
+pub type Message = serde_json::Value;
 pub type SharedHistory = Arc<Mutex<Vec<Message>>>;
 
-/// Start a session: a fresh history seeded with the (stable) system prompt.
 pub fn new_session() -> SharedHistory {
-    Arc::new(Mutex::new(vec![llm::system_msg(system_prompt())]))
+    Arc::new(Mutex::new(vec![serde_json::json!({
+        "role": "system",
+        "content": "Conversation transcript for a FastRLM-backed coding harness."
+    })]))
 }
 
-/// Messages produced by the agent as it works.
+#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    #[serde(default)]
+    pub cost: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RlmStep {
+    pub run_id: String,
+    pub parent_run_id: Option<String>,
+    pub depth: usize,
+    pub step: usize,
+    pub event_type: String,
+    pub code: String,
+    pub output: Option<String>,
+    pub has_error: bool,
+    pub reasoning: Option<String>,
+    pub usage: Usage,
+    pub total_usage: Usage,
+}
+
 pub enum AgentEvent {
-    /// A chunk of assistant text to append to the in-flight reply.
-    Delta(String),
-    /// A request for the harness to run a tool; `respond` carries the result.
-    Tool {
-        call: ToolCall,
-        respond: oneshot::Sender<ToolResult>,
+    Step(Box<RlmStep>),
+    Tool(ToolCall, Responder),
+    Final {
+        depth: usize,
+        result: serde_json::Value,
     },
-    /// Token accounting for the latest model request (incl. cache hits).
-    Usage(llm::Usage),
-    /// The turn is complete.
+    Usage(Usage),
+    Error(String),
     Done,
 }
 
-/// Kick off a response. Returns the task handle so the harness can `.abort()`
-/// to cancel an in-flight turn.
+#[derive(Serialize)]
+struct BridgeRequest<'a> {
+    context: &'a PromptContext,
+    model: &'a str,
+    session_dir: String,
+    session_id: &'a str,
+    log_dir: String,
+    instruction: &'static str,
+    broker_url: &'a str,
+    broker_token: &'a str,
+    workspace_mcp_script: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum BridgeMessage {
+    RlmEvent {
+        event: RawRlmEvent,
+    },
+    Complete {
+        result: serde_json::Value,
+        #[serde(default)]
+        usage: Usage,
+        #[allow(dead_code)]
+        log_file: Option<String>,
+    },
+    Error {
+        message: String,
+    },
+}
+
+#[derive(Deserialize, Default)]
+struct RawRlmEvent {
+    #[serde(default)]
+    event_type: String,
+    #[serde(default)]
+    run_id: String,
+    #[serde(default)]
+    parent_run_id: Option<String>,
+    #[serde(default)]
+    depth: usize,
+    #[serde(default)]
+    step: usize,
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    output: Option<String>,
+    #[serde(default, rename = "hasError")]
+    has_error: bool,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    usage: Usage,
+    #[serde(default, rename = "totalUsage")]
+    total_usage: Usage,
+    #[serde(default)]
+    result: serde_json::Value,
+}
+
 pub fn respond(
     context: PromptContext,
     config: Config,
     history: SharedHistory,
+    workspace_root: PathBuf,
+    session_id: String,
     tx: UnboundedSender<Event>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(err) = run(context, &config, &history, &tx).await {
-            let _ = tx.send(Event::Agent(AgentEvent::Delta(format!("⚠ {err}"))));
+        if let Err(error) = run(
+            context,
+            &config,
+            &history,
+            &workspace_root,
+            &session_id,
+            &tx,
+        )
+        .await
+        {
+            let _ = tx.send(Event::Agent(AgentEvent::Error(error)));
         }
         let _ = tx.send(Event::Agent(AgentEvent::Done));
     })
@@ -77,187 +164,252 @@ pub fn respond(
 
 async fn run(
     context: PromptContext,
-    cfg: &Config,
+    config: &Config,
     history: &SharedHistory,
+    workspace_root: &Path,
+    session_id: &str,
     tx: &UnboundedSender<Event>,
 ) -> Result<(), String> {
-    // Commit the user message, then work on a local copy of the history.
-    let mut messages = {
-        let mut h = history.lock().unwrap();
-        h.push(llm::user_msg(context.to_user_content()));
-        h.clone()
+    history.lock().unwrap().push(serde_json::json!({
+        "role": "user",
+        "content": context.to_user_content()
+    }));
+
+    let broker = crate::broker::Broker::start(tx.clone()).await?;
+
+    let state_root = app_data_dir();
+    std::fs::create_dir_all(&state_root)
+        .map_err(|e| format!("could not create FastRLM state directory: {e}"))?;
+    let workspace_mcp_script = state_root.join("workspace_mcp.ts");
+    std::fs::write(&workspace_mcp_script, WORKSPACE_MCP_SOURCE)
+        .map_err(|e| format!("could not install workspace MCP bridge: {e}"))?;
+    let request = BridgeRequest {
+        context: &context,
+        model: &config.model,
+        session_dir: state_root.join("rlm-sessions").display().to_string(),
+        session_id,
+        log_dir: state_root.join("rlm-logs").display().to_string(),
+        instruction: "You are an RLM agent powered by Fast-RLM. Act as a coding agent. Use the structured context fields directly. Use the workspace MCP tools through await mcp_call('workspace', tool_name, **arguments) to inspect and change files, and run relevant tests after edits. Mutating tools pause for user approval. Return a concise final answer in Markdown. Delegate independent read-only analysis to parallel sub-agents when useful; keep mutations in the root agent.",
+        broker_url: broker.url(),
+        broker_token: broker.token(),
+        workspace_mcp_script: workspace_mcp_script.display().to_string(),
     };
+    let input = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
 
-    for _ in 0..MAX_ROUNDS {
-        let turn = llm::stream_chat(cfg, &messages, tx).await?;
-        if let Some(usage) = turn.usage {
-            let _ = tx.send(Event::Agent(AgentEvent::Usage(usage)));
-        }
-
-        // The raw assistant message goes into history verbatim — never
-        // reconstructed from parsed fields (fast-rlm strategy).
-        let assistant = turn.message;
-
-        if turn.tool_calls.is_empty() {
-            // Plain answer — commit and finish the turn.
-            history.lock().unwrap().push(assistant);
-            return Ok(());
-        }
-
-        // Run all tools first, then commit the round atomically so history
-        // never holds tool_calls without their results.
-        let mut round = vec![assistant];
-        for call in &turn.tool_calls {
-            let result = dispatch(call, tx).await?;
-            round.push(llm::tool_msg(call.id.clone(), result));
-        }
-        messages.extend(round.iter().cloned());
-        history.lock().unwrap().extend(round);
+    let mut command = Command::new(find_python()?);
+    command
+        .arg("-c")
+        .arg(BRIDGE_SOURCE)
+        .current_dir(workspace_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(key) = &config.api_key {
+        command.env("RLM_MODEL_API_KEY", key);
     }
+    command.env("RLM_MODEL_BASE_URL", &config.base_url);
 
-    Err(format!("stopped after {MAX_ROUNDS} tool rounds"))
-}
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("could not start FastRLM: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("FastRLM stdin unavailable")?
+        .write_all(&input)
+        .await
+        .map_err(|e| format!("could not send context to FastRLM: {e}"))?;
 
-fn system_prompt() -> String {
-    let cwd = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| ".".to_string());
-    format!(
-        "You are fast-rlm-agent, a coding agent running in a terminal harness.\n\
-         Working directory: {cwd}\n\n\
-         User messages are JSON context dictionaries with `prompt`, `links`, and \
-         `files` keys. Follow `prompt`; use `links` for referenced URLs and \
-         `files` for preloaded workspace files (each has `path` and `content`).\n\n\
-         Use the available tools to inspect and modify the project, run commands, \
-         search the web, and fetch pages. File paths are relative to the working \
-         directory. Prefer edit over write for changing existing files. \
-         Destructive tools (write, edit, bash) require user approval and may \
-         be rejected — respect rejections instead of retrying. Use ask_question \
-         when you need the user to choose between concrete options.\n\n\
-         Keep responses concise and use markdown. When the task is done, briefly \
-         summarize what you did."
-    )
-}
+    let stdout = child.stdout.take().ok_or("FastRLM stdout unavailable")?;
+    let mut stderr = child.stderr.take().ok_or("FastRLM stderr unavailable")?;
+    let stderr_task = tokio::spawn(async move {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text).await;
+        text
+    });
 
-/// Map a model tool call onto the harness's `ToolCall`, run it through the
-/// UI (rendering + approval + execution), and format the result for the model.
-async fn dispatch(call: &AssistantToolCall, tx: &UnboundedSender<Event>) -> Result<String, String> {
-    let args: serde_json::Value =
-        serde_json::from_str(&call.function.arguments).unwrap_or(serde_json::Value::Null);
-    let str_arg = |key: &str| args[key].as_str().unwrap_or("").to_string();
-
-    let tool_call = match call.function.name.as_str() {
-        "read" => ToolCall::Read {
-            path: str_arg("path"),
-        },
-        "write" => ToolCall::Write {
-            path: str_arg("path"),
-            content: str_arg("content"),
-        },
-        "edit" => ToolCall::Edit {
-            path: str_arg("path"),
-            old_string: str_arg("old_string"),
-            new_string: str_arg("new_string"),
-            replace_all: args["replace_all"].as_bool().unwrap_or(false),
-        },
-        "bash" => ToolCall::Bash {
-            command: str_arg("command"),
-        },
-        "web_search" => ToolCall::WebSearch {
-            query: str_arg("query"),
-        },
-        "fetch" => ToolCall::Fetch {
-            url: str_arg("url"),
-            format: match args["format"].as_str() {
-                Some("text") => FetchFormat::Text,
-                _ => FetchFormat::Markdown,
+    let mut lines = BufReader::new(stdout).lines();
+    let mut final_result = None;
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .map_err(|e| format!("FastRLM event stream failed: {e}"))?
+    {
+        let message: BridgeMessage = serde_json::from_str(&line)
+            .map_err(|e| format!("invalid FastRLM bridge event: {e}: {line}"))?;
+        match message {
+            BridgeMessage::RlmEvent { event } => match event.event_type.as_str() {
+                "code_generated" | "execution_result" => {
+                    let _ = tx.send(Event::Agent(AgentEvent::Step(Box::new(RlmStep {
+                        run_id: event.run_id,
+                        parent_run_id: event.parent_run_id,
+                        depth: event.depth,
+                        step: event.step,
+                        event_type: event.event_type,
+                        code: event.code,
+                        output: event.output,
+                        has_error: event.has_error,
+                        reasoning: event.reasoning,
+                        usage: event.usage,
+                        total_usage: event.total_usage,
+                    }))));
+                }
+                "final_result" => {
+                    final_result = Some(event.result.clone());
+                    let _ = tx.send(Event::Agent(AgentEvent::Final {
+                        depth: event.depth,
+                        result: event.result,
+                    }));
+                }
+                _ => {}
             },
-        },
-        "ask_question" => {
-            let options: Vec<Choice> = args["options"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .map(|o| Choice {
-                            label: o["label"].as_str().unwrap_or("").to_string(),
-                            description: o["description"].as_str().unwrap_or("").to_string(),
-                        })
-                        .filter(|c| !c.label.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default();
-            if options.is_empty() {
-                return Ok("error: ask_question requires a non-empty options array".to_string());
+            BridgeMessage::Complete { result, usage, .. } => {
+                if final_result.is_none() {
+                    let _ = tx.send(Event::Agent(AgentEvent::Final {
+                        depth: 0,
+                        result: result.clone(),
+                    }));
+                    final_result = Some(result);
+                }
+                let _ = tx.send(Event::Agent(AgentEvent::Usage(usage)));
             }
-            ToolCall::AskQuestion(Question {
-                header: {
-                    let h = str_arg("header");
-                    if h.is_empty() {
-                        "Question".to_string()
-                    } else {
-                        h
-                    }
-                },
-                question: str_arg("question"),
-                multi_select: args["multi_select"].as_bool().unwrap_or(false),
-                options,
-            })
+            BridgeMessage::Error { message } => return Err(message),
         }
-        unknown => return Ok(format!("error: unknown tool '{unknown}'")),
-    };
+    }
 
-    // Keep option labels so we can express the user's selection back as text.
-    let labels: Vec<String> = match &tool_call {
-        ToolCall::AskQuestion(q) => q.options.iter().map(|o| o.label.clone()).collect(),
-        _ => Vec::new(),
-    };
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("could not wait for FastRLM: {e}"))?;
+    let stderr = stderr_task.await.unwrap_or_default();
+    if !status.success() {
+        let detail = stderr.lines().last().unwrap_or("unknown error");
+        return Err(format!("FastRLM exited with {status}: {detail}"));
+    }
 
-    match call_tool(tx, tool_call).await? {
-        ToolResult::Output { ok, text } => Ok(if ok { text } else { format!("ERROR: {text}") }),
-        ToolResult::Question { selected } => {
-            let chosen: Vec<&str> = selected
-                .iter()
-                .filter_map(|&i| labels.get(i).map(String::as_str))
-                .collect();
-            Ok(format!("User selected: {}", chosen.join(", ")))
-        }
+    if let Some(result) = final_result {
+        history
+            .lock()
+            .unwrap()
+            .push(serde_json::json!({ "role": "assistant", "content": format_result(&result) }));
+    }
+    broker.stop();
+    Ok(())
+}
+
+fn format_result(result: &serde_json::Value) -> String {
+    match result {
+        serde_json::Value::String(text) => text.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
     }
 }
 
-/// Send a tool call to the harness and await its reply.
-async fn call_tool(tx: &UnboundedSender<Event>, call: ToolCall) -> Result<ToolResult, String> {
-    let (respond, rx) = oneshot::channel();
-    tx.send(Event::Agent(AgentEvent::Tool { call, respond }))
-        .map_err(|_| "UI channel closed".to_string())?;
-    // Err => the harness dropped the responder (turn cancelled).
-    rx.await.map_err(|_| "tool call cancelled".to_string())
+fn app_data_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    Path::new(&home).join(".fast-rlm-agent")
+}
+
+fn find_python() -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os("FAST_RLM_PYTHON") {
+        return Ok(PathBuf::from(path));
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors() {
+            let candidate = ancestor.join(".venv").join("bin").join("python");
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    let development = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".venv")
+        .join("bin")
+        .join("python");
+    if development.is_file() {
+        return Ok(development);
+    }
+
+    Ok(PathBuf::from("python3"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc;
 
     #[test]
-    fn session_prefix_is_stable() {
-        // The cache-critical invariant: a session's opening bytes are
-        // deterministic — two sessions in the same process serialize the
-        // system prompt identically.
-        let a = new_session();
-        let b = new_session();
-        let ser = |h: &SharedHistory| serde_json::to_string(&*h.lock().unwrap()).unwrap();
-        assert_eq!(ser(&a), ser(&b));
+    fn parses_execution_and_completion_protocol_events() {
+        let step: BridgeMessage = serde_json::from_str(
+            r#"{"kind":"rlm_event","event":{"event_type":"execution_result","run_id":"abc","parent_run_id":null,"depth":1,"step":2,"code":"print(1)","output":"1","hasError":false,"usage":{"total_tokens":9},"totalUsage":{"total_tokens":12}}}"#,
+        )
+        .unwrap();
+        let BridgeMessage::RlmEvent { event } = step else {
+            panic!("expected RLM event");
+        };
+        assert_eq!(event.depth, 1);
+        assert_eq!(event.output.as_deref(), Some("1"));
+        assert_eq!(event.total_usage.total_tokens, 12);
 
-        let first = ser(&a);
-        assert!(first.contains("\"role\":\"system\""));
+        let complete: BridgeMessage = serde_json::from_str(
+            r#"{"kind":"complete","result":{"ok":true},"usage":{"prompt_tokens":20,"cost":0.01},"log_file":"run.jsonl"}"#,
+        )
+        .unwrap();
+        let BridgeMessage::Complete { result, usage, .. } = complete else {
+            panic!("expected completion");
+        };
+        assert_eq!(result["ok"], true);
+        assert_eq!(usage.prompt_tokens, 20);
+        assert_eq!(usage.cost, 0.01);
+    }
 
-        // Appending extends the serialized array without disturbing the
-        // existing prefix (append-only ⇒ prefix-stable requests).
-        a.lock().unwrap().push(llm::user_msg("hello"));
-        let second = ser(&a);
-        let prefix = first.trim_end_matches(']');
-        assert!(
-            second.starts_with(prefix),
-            "history serialization is not prefix-stable"
+    #[tokio::test]
+    #[ignore = "requires a configured live model and spends provider credits"]
+    async fn live_fast_rlm_can_edit_a_workspace_file() {
+        let workspace =
+            std::env::temp_dir().join(format!("fast-rlm-agent-live-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("proof.txt"), "BEFORE\n").unwrap();
+
+        let prompt = "Change proof.txt from BEFORE to FAST_RLM_EDIT_WORKS while preserving its newline. You must use edit_file, then read_file to verify it. Do not use write_file or create other files.";
+        let context = PromptContext::from_prompt(prompt.to_string(), &workspace);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let task = respond(
+            context,
+            Config::from_env(),
+            new_session(),
+            workspace.clone(),
+            format!("live-write-{}", std::process::id()),
+            tx,
         );
+
+        tokio::time::timeout(std::time::Duration::from_secs(300), async {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    Event::Agent(AgentEvent::Tool(call, responder)) => {
+                        // This opt-in test auto-approves only in its fresh temp workspace.
+                        let result = crate::tools::execute(&workspace, call).await;
+                        let _ = responder.send(crate::tools::ToolResult::Output {
+                            ok: result.ok,
+                            text: result.for_agent,
+                        });
+                    }
+                    Event::Agent(AgentEvent::Done) => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("live FastRLM write timed out");
+        task.await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("proof.txt")).unwrap(),
+            "FAST_RLM_EDIT_WORKS\n"
+        );
+        let _ = std::fs::remove_dir_all(workspace);
     }
 }

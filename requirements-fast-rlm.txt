@@ -1,0 +1,2 @@
+# Latest FastRLM main at integration time (2026-08-13).
+fast-rlm @ git+https://github.com/avbiswas/fast-rlm.git@f25f310be9832c9a914744fbf7116c715b84eeeb

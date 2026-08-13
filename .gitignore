@@ -2,6 +2,9 @@
 .envrc
 .env
 .env.*
+.venv/
+__pycache__/
+*.py[cod]
 
 # Build artifacts
 /target/

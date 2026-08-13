@@ -1,11 +1,10 @@
 //! fast-rlm-agent — a minimal ratatui + crossterm + tokio chat harness.
 //!
 //! Architecture (Elm-ish, like the Codex CLI):
-//!   * `App`   — all mutable state. Knows how to `update(event)` itself.
-//!   * `ui`    — a pure `draw(frame, &mut app)` that rebuilds the view each frame.
-//!   * `event` — a single async event hub fanning terminal input, a render tick,
-//!               and background agent messages into one `mpsc` channel.
-//!   * `agent` — the model backend. Currently a mock that *streams* a reply.
+//! * `App` — all mutable state and the central event reducer.
+//! * `ui` — a pure draw function that rebuilds the view each frame.
+//! * `event` — terminal input, render ticks, and background agent events.
+//! * `agent` — the FastRLM subprocess bridge and live event adapter.
 //!
 //! The whole app is single-threaded at the state level: mutations only ever
 //! happen on the main loop in response to an `Event`. Background work (the
@@ -13,11 +12,11 @@
 
 mod agent;
 mod app;
+mod broker;
 mod composer;
 mod config;
 mod context;
 mod event;
-mod llm;
 mod markdown;
 mod session;
 mod snapshot;
@@ -29,16 +28,21 @@ use std::io::{self, Stdout};
 
 use anyhow::Result;
 use crossterm::{
-    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
+    event::{DisableBracketedPaste, EnableBracketedPaste},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{
+    backend::CrosstermBackend,
+    widgets::{Paragraph, Widget, Wrap},
+    Terminal, TerminalOptions, Viewport,
+};
 
 use crate::app::App;
 use crate::event::{Event, Events};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
+const LIVE_VIEWPORT_HEIGHT: u16 = 12;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -69,6 +73,8 @@ async fn run(terminal: &mut Tui) -> Result<()> {
             }
         };
 
+        flush_stable_transcript(terminal, &mut app)?;
+
         if app.should_quit {
             app.save_session();
             break;
@@ -84,24 +90,40 @@ async fn run(terminal: &mut Tui) -> Result<()> {
 fn init_terminal() -> Result<Tui> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableMouseCapture
+    execute!(stdout, EnableBracketedPaste)?;
+    let height = crossterm::terminal::size()?.1.min(LIVE_VIEWPORT_HEIGHT);
+    let terminal = Terminal::with_options(
+        CrosstermBackend::new(stdout),
+        TerminalOptions {
+            viewport: Viewport::Inline(height),
+        },
     )?;
-    let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     Ok(terminal)
+}
+
+fn flush_stable_transcript(terminal: &mut Tui, app: &mut App) -> Result<()> {
+    let end = app.committable_items_end();
+    if end <= app.committed_items {
+        return Ok(());
+    }
+
+    let text = ui::render_items(&app.items[app.committed_items..end]);
+    let width = terminal.size()?.width;
+    let height = ui::visual_row_count(&text, width);
+    if height > 0 {
+        terminal.insert_before(height, |buffer| {
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .render(buffer.area, buffer);
+        })?;
+    }
+    app.committed_items = end;
+    Ok(())
 }
 
 fn restore_terminal() -> Result<()> {
     disable_raw_mode()?;
-    execute!(
-        io::stdout(),
-        LeaveAlternateScreen,
-        DisableBracketedPaste,
-        DisableMouseCapture
-    )?;
+    execute!(io::stdout(), DisableBracketedPaste)?;
     Ok(())
 }
 

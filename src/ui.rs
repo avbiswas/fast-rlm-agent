@@ -31,6 +31,16 @@ const MAX_OUTPUT_LINES: usize = 16;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let input_h = (app.composer.line_count() as u16 + 2).clamp(3, 10);
+    let has_live_transcript = app.items.is_empty() || app.committed_items < app.items.len();
+
+    if !has_live_transcript {
+        let input_area = Rect {
+            height: input_h.min(frame.area().height),
+            ..frame.area()
+        };
+        draw_input(frame, app, input_area);
+        return;
+    }
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -52,7 +62,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
 fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut title = if app.streaming {
-        " chat · ⏳ working — Esc to cancel".to_string()
+        " chat · ◆ FastRLM working — Esc to cancel".to_string()
     } else {
         " chat".to_string()
     };
@@ -60,17 +70,22 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
     // Cached collapsing to 0 on a growing conversation = a cache regression.
     if let Some(u) = &app.usage {
         title.push_str(&format!(
-            " · {} cached / {} in · {} out",
+            " · {} cached / {} in · {} out · ${:.4}",
             fmt_tokens(u.cached_tokens),
             fmt_tokens(u.prompt_tokens),
             fmt_tokens(u.completion_tokens),
+            u.cost,
         ));
     }
     title.push(' ');
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
 
-    let text = build_transcript(app);
+    let text = if app.items.is_empty() {
+        build_transcript(app)
+    } else {
+        render_items(&app.items[app.committed_items..])
+    };
     let total = visual_row_count(&text, inner.width);
     let viewport = inner.height;
     let max_scroll = total.saturating_sub(viewport);
@@ -109,7 +124,7 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
 /// Total visual rows a `Text` occupies when wrapped to `width` columns.
 /// `Paragraph::scroll` counts visual rows, not logical lines, so we must
 /// use this instead of `text.lines.len()` when computing max scroll.
-fn visual_row_count(text: &Text<'_>, width: u16) -> u16 {
+pub fn visual_row_count(text: &Text<'_>, width: u16) -> u16 {
     if width == 0 {
         return 0;
     }
@@ -169,8 +184,12 @@ fn build_transcript(app: &App) -> Text<'static> {
         ]);
     }
 
+    render_items(&app.items)
+}
+
+pub fn render_items(items: &[Item]) -> Text<'static> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for item in &app.items {
+    for item in items {
         match item {
             Item::User(text) => {
                 lines.push(role_header("You", ACCENT));
@@ -189,6 +208,7 @@ fn build_transcript(app: &App) -> Text<'static> {
                 )));
             }
             Item::Tool(run) => lines.extend(render_tool(run)),
+            Item::Rlm(step) => lines.extend(render_rlm_step(step)),
         }
         lines.push(Line::from(""));
     }
@@ -207,6 +227,93 @@ fn role_header(label: &str, color: Color) -> Line<'static> {
         label.to_string(),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     ))
+}
+
+fn render_rlm_step(step: &crate::agent::RlmStep) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let indent = "  ".repeat(step.depth);
+    let short_id: String = step
+        .run_id
+        .split('-')
+        .nth(1)
+        .unwrap_or(&step.run_id)
+        .chars()
+        .take(6)
+        .collect();
+    let state = if step.has_error {
+        ("error", RED)
+    } else if step.output.is_some() {
+        ("executed", GREEN)
+    } else {
+        ("generated", YELLOW)
+    };
+    lines.push(Line::from(vec![
+        Span::styled(format!("{indent}◆ "), Style::default().fg(state.1)),
+        Span::styled(
+            format!("RLM d{} · {} · step {}", step.depth, short_id, step.step),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {}", state.0), Style::default().fg(state.1)),
+    ]));
+
+    if !step.code.trim().is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("{indent}  Python"),
+            Style::default().fg(DIM),
+        )));
+        for mut line in markdown::highlight_code_lines(&step.code, "python")
+            .into_iter()
+            .take(12)
+            .map(Line::from)
+        {
+            line.spans.insert(0, Span::raw(format!("{indent}    ")));
+            lines.push(line);
+        }
+        let code_lines = step.code.lines().count();
+        if code_lines > 12 {
+            lines.push(Line::from(Span::styled(
+                format!("{indent}    … (+{} code lines)", code_lines - 12),
+                Style::default().fg(DIM),
+            )));
+        }
+    }
+
+    if let Some(output) = &step.output {
+        let output_lines: Vec<&str> = output.lines().collect();
+        let shown = output_lines.len().min(8);
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{indent}  {}",
+                if step.has_error { "Error" } else { "Output" }
+            ),
+            Style::default().fg(if step.has_error { RED } else { GREEN }),
+        )));
+        for output_line in &output_lines[..shown] {
+            lines.push(Line::from(Span::styled(
+                format!("{indent}    {output_line}"),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+        if output_lines.len() > shown {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{indent}    … (+{} output lines)",
+                    output_lines.len() - shown
+                ),
+                Style::default().fg(DIM),
+            )));
+        }
+    }
+
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{indent}  {} tokens · ${:.4}",
+            fmt_tokens(step.usage.total_tokens),
+            step.usage.cost
+        ),
+        Style::default().fg(DIM),
+    )));
+    lines
 }
 
 // ---- unified tool rendering ----------------------------------------------
@@ -403,7 +510,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Question(_) => ("answer the question above", YELLOW),
         Mode::Resume(_) => ("pick a session above", YELLOW),
         Mode::UndoPicker { .. } => ("pick a checkpoint to restore", YELLOW),
-        Mode::Chat if app.streaming => ("working… Esc cancels", DIM),
+        Mode::Chat if app.streaming => ("FastRLM exploring… Esc cancels", DIM),
         Mode::Chat => (
             "Enter send · Alt+Enter newline · /resume · /undo · Esc quit",
             DIM,
@@ -670,5 +777,36 @@ mod tests {
         assert!(!texts.iter().any(|t| t.contains("unchanged")));
         assert!(texts.iter().any(|t| t.contains("- b")));
         assert!(texts.iter().any(|t| t.contains("+ B")));
+    }
+
+    #[test]
+    fn rlm_step_renders_agent_code_output_and_usage() {
+        let step = crate::agent::RlmStep {
+            run_id: "123-child01".to_string(),
+            parent_run_id: Some("root".to_string()),
+            depth: 1,
+            step: 2,
+            event_type: "execution_result".to_string(),
+            code: "print(len(context['files']))".to_string(),
+            output: Some("4".to_string()),
+            has_error: false,
+            reasoning: None,
+            usage: crate::agent::Usage {
+                total_tokens: 1200,
+                cost: 0.0123,
+                ..Default::default()
+            },
+            total_usage: Default::default(),
+        };
+
+        let rendered = render_rlm_step(&step)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("RLM d1 · child0 · step 2"));
+        assert!(rendered.contains("print(len(context['files']))"));
+        assert!(rendered.contains("Output"));
+        assert!(rendered.contains("1.2k tokens · $0.0123"));
     }
 }

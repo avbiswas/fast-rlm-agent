@@ -30,8 +30,14 @@ a dependable coding harness. Items are roughly ordered by risk and dependency.
 
 ## Context and model loop
 
+- [x] Replace the direct response engine with FastRLM and render its live REPL
+  steps.
+- [x] Persist FastRLM REPL memory across chat turns and resumed sessions.
 - [x] Preprocess prompts into structured `prompt`, `links`, and preloaded `files`
   fields compatible with FastRLM dictionary input.
+- [x] Bridge reviewed host read, write, exact-edit, and shell tools into FastRLM.
+- [ ] Bridge structured user questions into FastRLM.
+- [ ] Make `/undo` restore FastRLM REPL state as well as files and transcript.
 - [ ] Estimate context usage before each request and show remaining capacity.
 - [ ] Compact old conversation history at explicit checkpoints while retaining
   recent raw model/tool rounds.
@@ -43,12 +49,12 @@ a dependable coding harness. Items are roughly ordered by risk and dependency.
 
 ## Provider compatibility
 
-- [ ] Add provider capability profiles or detection for streaming, tool calls,
-  reasoning replay, usage fields, and `stream_options`.
-- [ ] Parse SSE frames robustly, including final frames without a trailing
-  newline and provider error events.
-- [ ] Add retry policy for transient connection and rate-limit failures.
-- [ ] Reuse HTTP clients instead of constructing a client per request.
+- [ ] Expose FastRLM provider, recursive depth, call, and cost limits through
+  CLI/configuration instead of bridge defaults.
+- [ ] Add an explicit upgrade check for the pinned FastRLM revision and run the
+  bridge contract tests before changing it.
+- [ ] Surface FastRLM retry, rate-limit, and provider errors with actionable
+  terminal messages.
 
 ## Sessions and recovery
 
@@ -82,7 +88,7 @@ a dependable coding harness. Items are roughly ordered by risk and dependency.
 - [ ] Add non-interactive/headless operation.
 - [ ] Add structured diagnostic logging and an opt-in debug view.
 - [ ] Add packaging, release, and installation workflows.
-- [ ] Keep the project clean under `cargo fmt`, `cargo test`, and strict Clippy.
+- [x] Keep the project clean under `cargo fmt`, `cargo test`, and strict Clippy.
 
 ## End-to-end verification
 

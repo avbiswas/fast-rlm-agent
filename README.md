@@ -1,26 +1,28 @@
 # fast-rlm-agent
 
-A small terminal coding harness built with Rust and Ratatui. It connects to an
-OpenAI-compatible model endpoint, streams responses into the terminal, and lets
-the model inspect and modify the current project through reviewed tool calls.
+A terminal harness for [FastRLM](https://github.com/avbiswas/fast-rlm), built
+with Rust and Ratatui. It gives FastRLM structured source context and renders
+its recursive agents, generated Python, REPL output, final result, and usage as
+the run happens.
 
 ## Features
 
-- Streaming terminal chat interface
-- Read, write, and exact-string edit tools
-- Shell commands with an approval prompt
-- Inline, syntax-highlighted diffs before file changes are applied
-- Workspace boundary checks for file operations
-- Web search through Exa and direct URL fetching
-- Multiple-choice questions from the agent
-- Saved sessions with `/resume`
-- Per-turn filesystem and conversation checkpoints with `/undo`
-- Prompt-cache usage displayed in the UI when the provider reports it
-- Structured input preprocessing into `prompt`, `links`, and `files`
+- Live FastRLM agent and REPL-step rendering
+- Recursive sub-agent execution with generated Python and captured output
+- Structured dictionary input with `prompt`, `links`, and `files`
+- A bounded `fetch_url` REPL tool for external sources
+- Reviewed workspace read, write, exact-edit, and shell tools over MCP
+- Diff previews and explicit approval before mutations or commands
+- Persistent FastRLM REPL memory across follow-up turns and `/resume`
+- Syntax-highlighted Python with compact output and error previews
+- Token, cache, reasoning-token, and cost accounting
+- Local JSON chat sessions and FastRLM run logs
 
 ## Setup
 
-You need a recent Rust toolchain and an OpenAI-compatible model API.
+You need a recent Rust toolchain, Python 3.10+, Deno 2+, `uv`, and an
+OpenAI-compatible model API. FastRLM is pinned to the latest tested GitHub
+revision in `requirements-fast-rlm.txt`.
 
 Clone or download this repository, then enter its directory:
 
@@ -36,10 +38,10 @@ export API_KEY="your-api-key"
 export MODEL_NAME="your-model-name"
 ```
 
-Web search is optional and uses Exa:
+Install the FastRLM Python backend:
 
 ```sh
-export EXA_API_KEY="your-exa-api-key"
+./scripts/setup-fast-rlm.sh
 ```
 
 Then build and run the harness from the project you want the agent to work in:
@@ -62,13 +64,11 @@ cargo run
 - `Alt+Enter` or `Shift+Enter` inserts a newline.
 - `Esc` cancels the active turn or exits when idle.
 - `/resume` loads a saved conversation.
-- `/undo` restores files and conversation state to an earlier turn.
+- `/undo` restores the local transcript/filesystem checkpoint. Rewinding
+  FastRLM's persisted REPL memory is not implemented yet.
 
-File writes, edits, and shell commands require approval. File tools are confined
-to the directory where the harness was started. Shell commands start in that
-directory but are not yet OS-sandboxed, so review commands carefully.
-
-Sessions and undo snapshots are stored under `~/.fast-rlm-agent/`.
+Chat sessions, FastRLM REPL state, run logs, and undo snapshots are stored under
+`~/.fast-rlm-agent/`.
 
 Before each model turn, the harness extracts HTTP(S) URLs and referenced UTF-8
 workspace files from the prompt. The model receives a structured context object:
@@ -81,21 +81,36 @@ workspace files from the prompt. The model receives a structured context object:
 }
 ```
 
+Unlike the previous direct-chat implementation, this object is passed to
+FastRLM as a real Python dictionary. The root agent can inspect and transform it
+inside its REPL without first asking the model to parse a giant JSON string.
+
 Files can be referenced as ordinary paths, backtick paths, `@paths`, or local
 Markdown links. Missing, binary, and out-of-workspace files are not loaded.
+Links remain structured strings; FastRLM can retrieve them through `fetch_url`.
 
-## Demo cases
+## Current limitations
 
-The repository includes small, repeatable coding tasks with hidden verifiers:
+FastRLM can now read, write, and edit workspace files and run commands through
+the Rust approval boundary. Directory listing, globbing, text search, patch
+editing, process-group cancellation, and rewinding FastRLM's REPL state during
+`/undo` remain on the roadmap.
+
+## Launch demo
+
+The included launch prompt mixes several URLs and local source files. Run the
+harness from this repository, paste the contents of `demo/PROMPT.md`, and watch
+FastRLM recursively inspect the sources while the TUI renders its generated
+Python, REPL output, child agents, tokens, and cost:
 
 ```sh
-./harness-tests/run.sh list
-./harness-tests/run.sh run fix-discount
+cargo run --release
 ```
 
-See [harness-tests/README.md](harness-tests/README.md) for the full workflow.
+The repeatable fixtures under `harness-tests/` validate structured context and
+coding behavior with hidden verifiers.
 
 ## Acknowledgements
 
-Huge shoutout to [FastRLM](https://github.com/avbiswas/fast-rlm), which provides
-the main backend-engine foundation and inspiration for this coding harness.
+FastRLM is the backend engine for this harness. Huge shoutout to its recursive
+REPL design, structured I/O, resumable memory, and live event API.

@@ -1,8 +1,9 @@
 //! Runtime configuration, loaded from environment variables at startup.
 //!
-//! The model fields (`BASE_URL`, `API_KEY`, `MODEL_NAME`) describe an
-//! OpenAI-compatible endpoint for the (forthcoming) real agent client.
-//! `EXA_API_KEY` powers the web-search tool.
+//! The model fields (`BASE_URL`, `API_KEY`, `MODEL_NAME`) describe the endpoint
+//! FastRLM uses for its root and recursive agents. `EXA_API_KEY` is retained
+//! for the reviewed Rust web-search tool that will rejoin through the planned
+//! host-tool bridge.
 
 #[derive(Clone)]
 pub struct Config {

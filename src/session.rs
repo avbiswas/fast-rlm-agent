@@ -2,19 +2,19 @@
 //! reloaded with `/resume`.
 //!
 //! A session file carries both layers of state:
-//!  * `history` — the raw LLM messages, verbatim. Resuming replays the exact
-//!    bytes the provider saw before, so a resumed conversation keeps its
-//!    prefix-stable cache behaviour (and may even still hit a warm cache).
-//!  * `items` — the rendered transcript, so the UI redisplays faithfully
-//!    (diffs, tool outputs, notes and all).
+//!  * `history` — a lightweight copy of the visible user/assistant turns.
+//!  * `items` — the rendered transcript, so the UI redisplays faithfully.
+//!
+//! FastRLM owns the authoritative model and REPL state in its separate
+//! persistent session directory; both layers share the same session id.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::Message;
 use crate::app::{Item, ToolRun};
-use crate::llm::Message;
 use crate::tools::ToolStatus;
 
 #[derive(Serialize, Deserialize)]
@@ -127,7 +127,10 @@ fn read_session(path: &Path) -> std::io::Result<SavedSession> {
 mod tests {
     use super::*;
     use crate::app::ToolBody;
-    use crate::llm::{system_msg, user_msg};
+
+    fn message(role: &str, content: &str) -> Message {
+        serde_json::json!({ "role": role, "content": content })
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("fra-sess-{}-{name}", std::process::id()));
@@ -142,7 +145,10 @@ mod tests {
             cwd: "/tmp/project".to_string(),
             created_at: 100,
             updated_at,
-            history: vec![system_msg("sys"), user_msg("build me a thing")],
+            history: vec![
+                message("system", "sys"),
+                message("user", "build me a thing"),
+            ],
             items: vec![
                 Item::User("build me a thing".to_string()),
                 Item::Assistant("On it. **Done.**".to_string()),
