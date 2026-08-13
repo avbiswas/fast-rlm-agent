@@ -39,7 +39,11 @@ impl Snapshotter {
         }
         let cwd = cwd.canonicalize().unwrap_or(cwd);
         let dir = shadow_dir(&cwd);
-        let s = Self { dir, worktree: cwd, checkpoints: Vec::new() };
+        let s = Self {
+            dir,
+            worktree: cwd,
+            checkpoints: Vec::new(),
+        };
         s.init().ok()?;
         Some(s)
     }
@@ -52,9 +56,14 @@ impl Snapshotter {
     pub fn capture(&mut self, items_len: usize, history_len: usize) -> bool {
         let ok = (|| -> Result<(), String> {
             self.git(&["add", "-A"])?;
-            self.git(&["commit", "-m", "snapshot", "--allow-empty",
-                       "--author=fast-rlm-agent <agent@local>",
-                       "--no-gpg-sign"])?;
+            self.git(&[
+                "commit",
+                "-m",
+                "snapshot",
+                "--allow-empty",
+                "--author=fast-rlm-agent <agent@local>",
+                "--no-gpg-sign",
+            ])?;
             Ok(())
         })();
         if ok.is_err() {
@@ -113,7 +122,11 @@ impl Snapshotter {
 
         // Drop this checkpoint and everything newer.
         self.checkpoints.truncate(idx);
-        Some(Checkpoint { commit, items_len, history_len })
+        Some(Checkpoint {
+            commit,
+            items_len,
+            history_len,
+        })
     }
 
     // ---- private -----------------------------------------------------------
@@ -160,7 +173,8 @@ impl Snapshotter {
         // Point the shadow repo's worktree at our cwd so git doesn't complain
         // about operating outside it.
         let out = Command::new("git")
-            .arg("--git-dir").arg(self.git_dir())
+            .arg("--git-dir")
+            .arg(self.git_dir())
             .args(["config", "core.worktree"])
             .arg(&self.worktree)
             .output()
@@ -168,9 +182,13 @@ impl Snapshotter {
         check(out)?;
 
         // Git refuses commits without user identity.
-        for (key, val) in [("user.name", "fast-rlm-agent"), ("user.email", "agent@local")] {
+        for (key, val) in [
+            ("user.name", "fast-rlm-agent"),
+            ("user.email", "agent@local"),
+        ] {
             let out = Command::new("git")
-                .arg("--git-dir").arg(self.git_dir())
+                .arg("--git-dir")
+                .arg(self.git_dir())
                 .args(["config", key, val])
                 .output()
                 .map_err(|e| e.to_string())?;
@@ -250,28 +268,35 @@ mod tests {
     struct TempDir(PathBuf);
     impl TempDir {
         fn new(name: &str) -> Self {
-            let p = std::env::temp_dir()
-                .join(format!("fra-snap-{}-{name}", std::process::id()));
+            let p = std::env::temp_dir().join(format!("fra-snap-{}-{name}", std::process::id()));
             let _ = fs::remove_dir_all(&p);
             fs::create_dir_all(&p).unwrap();
             Self(p)
         }
-        fn path(&self) -> &Path { &self.0 }
+        fn path(&self) -> &Path {
+            &self.0
+        }
     }
     impl Drop for TempDir {
-        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
     fn make_snapshotter(worktree: &Path) -> Snapshotter {
         // Use a separate temp dir for the shadow repo so the worktree stays clean.
-        let shadow_parent = std::env::temp_dir()
-            .join(format!("fra-shadow-{}", std::process::id()));
-        let slug = worktree.to_string_lossy().replace(['/', '\\', ':', ' '], "_")
-            .trim_start_matches('_').to_string();
+        let shadow_parent = std::env::temp_dir().join(format!("fra-shadow-{}", std::process::id()));
+        let slug = worktree
+            .to_string_lossy()
+            .replace(['/', '\\', ':', ' '], "_")
+            .trim_start_matches('_')
+            .to_string();
         let dir = shadow_parent.join(slug);
         let s = Snapshotter {
             dir,
-            worktree: worktree.canonicalize().unwrap_or_else(|_| worktree.to_path_buf()),
+            worktree: worktree
+                .canonicalize()
+                .unwrap_or_else(|_| worktree.to_path_buf()),
             checkpoints: Vec::new(),
         };
         s.init().expect("init failed");
@@ -309,7 +334,10 @@ mod tests {
 
         snap.restore().expect("restore failed");
 
-        assert!(!wt.path().join("new.txt").exists(), "new.txt should be deleted on restore");
+        assert!(
+            !wt.path().join("new.txt").exists(),
+            "new.txt should be deleted on restore"
+        );
         assert!(wt.path().join("existing.txt").exists());
         let content = fs::read_to_string(wt.path().join("existing.txt")).unwrap();
         assert_eq!(content, "keep\n");

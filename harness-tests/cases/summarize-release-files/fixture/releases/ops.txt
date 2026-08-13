@@ -1,0 +1,5 @@
+Release: Aurora 2.4
+Area: Ops
+Owner: Chen
+Completed: Production rollback drill completed in 11 minutes.
+Blocker: None.

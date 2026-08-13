@@ -15,6 +15,7 @@ mod agent;
 mod app;
 mod composer;
 mod config;
+mod context;
 mod event;
 mod llm;
 mod markdown;
@@ -22,14 +23,13 @@ mod session;
 mod snapshot;
 mod tools;
 mod ui;
+mod workspace;
 
 use std::io::{self, Stdout};
 
 use anyhow::Result;
 use crossterm::{
-    event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    },
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };

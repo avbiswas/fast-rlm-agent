@@ -1,0 +1,13 @@
+Analyze releases/api.txt, releases/cli.txt, releases/ui.txt, and releases/ops.txt.
+Create release-summary.json with this exact shape:
+
+{
+  "release": "Aurora 2.4",
+  "ready": false,
+  "blockers": ["..."],
+  "completed": ["..."],
+  "owners": {"area": "person"}
+}
+
+Include every blocker and completed item from the files, without duplicates.
+Use concise item text and preserve each area's owner under a lowercase area key.

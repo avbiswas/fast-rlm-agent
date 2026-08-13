@@ -84,7 +84,8 @@ impl Writer {
             Tag::Strikethrough => self.style = self.style.add_modifier(Modifier::CROSSED_OUT),
             Tag::BlockQuote(_) => {
                 self.flush_line();
-                self.spans.push(Span::styled("▏ ", Style::default().fg(Color::DarkGray)));
+                self.spans
+                    .push(Span::styled("▏ ", Style::default().fg(Color::DarkGray)));
             }
             Tag::List(start) => self.list_stack.push(start),
             Tag::Item => {
@@ -106,12 +107,11 @@ impl Writer {
             Tag::CodeBlock(kind) => {
                 self.flush_line();
                 let lang = match kind {
-                    CodeBlockKind::Fenced(info) => {
-                        info.split(|c: char| c == ',' || c.is_whitespace())
-                            .next()
-                            .unwrap_or("")
-                            .to_string()
-                    }
+                    CodeBlockKind::Fenced(info) => info
+                        .split(|c: char| c == ',' || c.is_whitespace())
+                        .next()
+                        .unwrap_or("")
+                        .to_string(),
                     CodeBlockKind::Indented => String::new(),
                 };
                 self.code = Some((lang, String::new()));
@@ -235,9 +235,7 @@ fn assets() -> (&'static SyntaxSet, &'static Theme) {
     let syntax = SYNTAX.get_or_init(two_face::syntax::extra_newlines);
     let theme = THEME.get_or_init(|| {
         let themes = two_face::theme::extra();
-        themes
-            .get(two_face::theme::EmbeddedThemeName::Nord)
-            .clone()
+        themes.get(two_face::theme::EmbeddedThemeName::Nord).clone()
     });
     (syntax, theme)
 }

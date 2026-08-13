@@ -1,0 +1,22 @@
+{
+  "release": "Aurora 2.4",
+  "ready": false,
+  "blockers": [
+    "Rate-limit headers are missing from 429 responses",
+    "Windows paths fail when the workspace contains spaces",
+    "Screen readers do not announce failed deployment status"
+  ],
+  "completed": [
+    "Added cursor pagination to the audit endpoint",
+    "Added JSON output to the deploy command",
+    "Documented non-interactive authentication",
+    "Added keyboard navigation to the release picker",
+    "Production rollback drill completed in 11 minutes"
+  ],
+  "owners": {
+    "api": "Mina",
+    "cli": "Jules",
+    "ui": "Priya",
+    "ops": "Chen"
+  }
+}

@@ -13,9 +13,9 @@ use ratatui::{
 };
 
 use crate::app::{App, Item, Mode, QuestionModal, ResumePicker, ToolBody, ToolRun};
-use crate::snapshot::Checkpoint;
 use crate::markdown;
 use crate::session;
+use crate::snapshot::Checkpoint;
 use crate::tools::ToolStatus;
 
 const ACCENT: Color = Color::Rgb(136, 192, 208);
@@ -117,7 +117,11 @@ fn visual_row_count(text: &Text<'_>, width: u16) -> u16 {
         .iter()
         .map(|line| {
             let w = line.width() as u16;
-            if w <= width { 1 } else { w.div_ceil(width) }
+            if w <= width {
+                1
+            } else {
+                w.div_ceil(width)
+            }
         })
         .sum()
 }
@@ -400,7 +404,10 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Resume(_) => ("pick a session above", YELLOW),
         Mode::UndoPicker { .. } => ("pick a checkpoint to restore", YELLOW),
         Mode::Chat if app.streaming => ("working… Esc cancels", DIM),
-        Mode::Chat => ("Enter send · Alt+Enter newline · /resume · /undo · Esc quit", DIM),
+        Mode::Chat => (
+            "Enter send · Alt+Enter newline · /resume · /undo · Esc quit",
+            DIM,
+        ),
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -473,10 +480,7 @@ fn draw_resume(frame: &mut Frame, picker: &ResumePicker) {
 
     // Keep the selection in view when the list is long.
     let scroll = (picker.cursor as u16 * 2).saturating_sub(inner.height.saturating_sub(2));
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).scroll((scroll, 0)),
-        inner,
-    );
+    frame.render_widget(Paragraph::new(Text::from(lines)).scroll((scroll, 0)), inner);
 }
 
 /// 42 → "just now", 300 → "5m ago", 7200 → "2h ago", 200000 → "2d ago".
@@ -497,7 +501,9 @@ fn draw_undo_picker(frame: &mut Frame, app: &App, cursor: usize) {
         None => return,
     };
     let checkpoints = snap.checkpoints();
-    if checkpoints.is_empty() { return; }
+    if checkpoints.is_empty() {
+        return;
+    }
 
     let area = centered(frame.area(), 70, 60);
     frame.render_widget(Clear, area);
@@ -539,10 +545,7 @@ fn draw_undo_picker(frame: &mut Frame, app: &App, cursor: usize) {
     }
 
     let scroll = (cursor as u16).saturating_sub(inner.height.saturating_sub(1));
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).scroll((scroll, 0)),
-        inner,
-    );
+    frame.render_widget(Paragraph::new(Text::from(lines)).scroll((scroll, 0)), inner);
 }
 
 /// First line of the user message that started the turn this checkpoint precedes.

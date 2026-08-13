@@ -8,7 +8,11 @@
 //! the same `● Verb(args)` / `⎿ output` shape in the transcript. Adding a new
 //! tool = a new `ToolCall` variant + an arm in `execute`.
 
+use std::path::Path;
+
 use tokio::sync::oneshot;
+
+use crate::workspace;
 
 /// A request from the agent for the harness to run a tool.
 pub enum ToolCall {
@@ -119,17 +123,17 @@ pub struct Run {
 }
 
 /// Execute a tool. This is where the harness actually touches the system.
-pub async fn execute(call: ToolCall) -> Run {
+pub async fn execute(workspace_root: &Path, call: ToolCall) -> Run {
     match call {
-        ToolCall::Read { path } => read(path).await,
-        ToolCall::Write { path, content } => write(path, content).await,
+        ToolCall::Read { path } => read(workspace_root, path).await,
+        ToolCall::Write { path, content } => write(workspace_root, path, content).await,
         ToolCall::Edit {
             path,
             old_string,
             new_string,
             replace_all,
-        } => edit(path, old_string, new_string, replace_all).await,
-        ToolCall::Bash { command } => bash(command).await,
+        } => edit(workspace_root, path, old_string, new_string, replace_all).await,
+        ToolCall::Bash { command } => bash(workspace_root, command).await,
         ToolCall::WebSearch { query } => web_search(query).await,
         ToolCall::Fetch { url, format } => fetch(url, format).await,
         // Questions are resolved by the UI, never executed here.
@@ -142,8 +146,12 @@ pub async fn execute(call: ToolCall) -> Run {
     }
 }
 
-async fn read(path: String) -> Run {
-    match tokio::fs::read_to_string(&path).await {
+async fn read(workspace_root: &Path, path: String) -> Run {
+    let resolved = match workspace::resolve_existing(workspace_root, &path) {
+        Ok(path) => path,
+        Err(error) => return path_error(error),
+    };
+    match tokio::fs::read_to_string(&resolved).await {
         Ok(content) => {
             let n = content.lines().count();
             Run {
@@ -162,11 +170,15 @@ async fn read(path: String) -> Run {
     }
 }
 
-async fn write(path: String, content: String) -> Run {
-    if let Some(parent) = std::path::Path::new(&path).parent() {
+async fn write(workspace_root: &Path, path: String, content: String) -> Run {
+    let resolved = match workspace::resolve_for_write(workspace_root, &path) {
+        Ok(path) => path,
+        Err(error) => return path_error(error),
+    };
+    if let Some(parent) = resolved.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
-    match tokio::fs::write(&path, &content).await {
+    match tokio::fs::write(&resolved, &content).await {
         Ok(_) => {
             let n = content.lines().count();
             Run {
@@ -192,6 +204,7 @@ async fn write(path: String, content: String) -> Run {
 /// or matches more than once without `replace_all` — these come back as
 /// strings the model can act on (add more context, set `replace_all`, …).
 pub fn prepare_edit(
+    workspace_root: &Path,
     path: &str,
     old_string: &str,
     new_string: &str,
@@ -203,8 +216,9 @@ pub fn prepare_edit(
     if old_string == new_string {
         return Err("old_string and new_string are identical".into());
     }
+    let resolved = workspace::resolve_existing(workspace_root, path)?;
     let content =
-        std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+        std::fs::read_to_string(resolved).map_err(|e| format!("cannot read {path}: {e}"))?;
     let count = content.matches(old_string).count();
     if count == 0 {
         return Err(format!(
@@ -226,37 +240,50 @@ pub fn prepare_edit(
     Ok((content, new_content, replaced))
 }
 
-async fn edit(path: String, old_string: String, new_string: String, replace_all: bool) -> Run {
+async fn edit(
+    workspace_root: &Path,
+    path: String,
+    old_string: String,
+    new_string: String,
+    replace_all: bool,
+) -> Run {
     // Re-validate at execution time — the file may have changed since the
     // diff was shown for approval.
-    match prepare_edit(&path, &old_string, &new_string, replace_all) {
+    match prepare_edit(workspace_root, &path, &old_string, &new_string, replace_all) {
         Err(e) => Run {
             ok: false,
             for_agent: format!("ERROR: {e}"),
             summary: e,
             output: None,
         },
-        Ok((_, new_content, n)) => match tokio::fs::write(&path, &new_content).await {
-            Ok(_) => Run {
-                ok: true,
-                for_agent: format!("edited {path}: replaced {n} occurrence(s)"),
-                summary: format!("Replaced {n} occurrence(s)"),
-                output: None,
-            },
-            Err(e) => Run {
-                ok: false,
-                for_agent: format!("error writing {path}: {e}"),
-                summary: format!("write failed: {e}"),
-                output: None,
-            },
-        },
+        Ok((_, new_content, n)) => {
+            let resolved = match workspace::resolve_existing(workspace_root, &path) {
+                Ok(path) => path,
+                Err(error) => return path_error(error),
+            };
+            match tokio::fs::write(&resolved, &new_content).await {
+                Ok(_) => Run {
+                    ok: true,
+                    for_agent: format!("edited {path}: replaced {n} occurrence(s)"),
+                    summary: format!("Replaced {n} occurrence(s)"),
+                    output: None,
+                },
+                Err(e) => Run {
+                    ok: false,
+                    for_agent: format!("error writing {path}: {e}"),
+                    summary: format!("write failed: {e}"),
+                    output: None,
+                },
+            }
+        }
     }
 }
 
-async fn bash(command: String) -> Run {
+async fn bash(workspace_root: &Path, command: String) -> Run {
     let result = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(&command)
+        .current_dir(workspace_root)
         .output()
         .await;
 
@@ -284,6 +311,15 @@ async fn bash(command: String) -> Run {
             summary: format!("error: {e}"),
             output: Some(e.to_string()),
         },
+    }
+}
+
+fn path_error(error: String) -> Run {
+    Run {
+        ok: false,
+        for_agent: format!("ERROR: {error}"),
+        summary: error,
+        output: None,
     }
 }
 
@@ -471,7 +507,13 @@ async fn fetch(url: String, format: FetchFormat) -> Run {
             status.as_u16(),
             if truncated { " (truncated)" } else { "" }
         ),
-        output: Some(text.chars().take(MAX_UI_CHARS).collect::<String>().trim().to_string()),
+        output: Some(
+            text.chars()
+                .take(MAX_UI_CHARS)
+                .collect::<String>()
+                .trim()
+                .to_string(),
+        ),
     }
 }
 
@@ -598,6 +640,10 @@ mod tests {
         fn path(&self) -> &str {
             self.0.to_str().unwrap()
         }
+
+        fn workspace(&self) -> &Path {
+            self.0.parent().unwrap()
+        }
     }
     impl Drop for TempFile {
         fn drop(&mut self) {
@@ -608,7 +654,8 @@ mod tests {
     #[test]
     fn edit_replaces_unique_match() {
         let f = TempFile::new("unique.rs", "fn main() {\n    let x = 1;\n}\n");
-        let (old, new, n) = prepare_edit(f.path(), "let x = 1;", "let x = 2;", false).unwrap();
+        let (old, new, n) =
+            prepare_edit(f.workspace(), f.path(), "let x = 1;", "let x = 2;", false).unwrap();
         assert_eq!(n, 1);
         assert!(old.contains("x = 1"));
         assert!(new.contains("x = 2") && !new.contains("x = 1"));
@@ -617,14 +664,14 @@ mod tests {
     #[test]
     fn edit_rejects_missing_old_string() {
         let f = TempFile::new("missing.txt", "hello world\n");
-        let err = prepare_edit(f.path(), "goodbye", "hi", false).unwrap_err();
+        let err = prepare_edit(f.workspace(), f.path(), "goodbye", "hi", false).unwrap_err();
         assert!(err.contains("not found"), "err: {err}");
     }
 
     #[test]
     fn edit_rejects_ambiguous_match() {
         let f = TempFile::new("ambig.txt", "foo\nfoo\nfoo\n");
-        let err = prepare_edit(f.path(), "foo", "bar", false).unwrap_err();
+        let err = prepare_edit(f.workspace(), f.path(), "foo", "bar", false).unwrap_err();
         assert!(err.contains("3 times"), "err: {err}");
         assert!(err.contains("replace_all"), "err: {err}");
     }
@@ -632,7 +679,7 @@ mod tests {
     #[test]
     fn edit_replace_all_replaces_every_match() {
         let f = TempFile::new("all.txt", "foo\nfoo\nfoo\n");
-        let (_, new, n) = prepare_edit(f.path(), "foo", "bar", true).unwrap();
+        let (_, new, n) = prepare_edit(f.workspace(), f.path(), "foo", "bar", true).unwrap();
         assert_eq!(n, 3);
         assert_eq!(new, "bar\nbar\nbar\n");
     }
@@ -640,22 +687,25 @@ mod tests {
     #[test]
     fn edit_rejects_empty_and_identical_and_missing_file() {
         let f = TempFile::new("guards.txt", "content\n");
-        assert!(prepare_edit(f.path(), "", "x", false).is_err());
-        assert!(prepare_edit(f.path(), "content", "content", false).is_err());
-        assert!(prepare_edit("/nonexistent/nope.txt", "a", "b", false)
+        assert!(prepare_edit(f.workspace(), f.path(), "", "x", false).is_err());
+        assert!(prepare_edit(f.workspace(), f.path(), "content", "content", false).is_err());
+        assert!(prepare_edit(f.workspace(), "missing.txt", "a", "b", false)
             .unwrap_err()
-            .contains("cannot read"));
+            .contains("cannot access"));
     }
 
     #[tokio::test]
     async fn edit_execute_writes_file() {
         let f = TempFile::new("exec.txt", "version = 1\nname = test\n");
-        let run = execute(ToolCall::Edit {
-            path: f.path().to_string(),
-            old_string: "version = 1".to_string(),
-            new_string: "version = 2".to_string(),
-            replace_all: false,
-        })
+        let run = execute(
+            f.workspace(),
+            ToolCall::Edit {
+                path: f.path().to_string(),
+                old_string: "version = 1".to_string(),
+                new_string: "version = 2".to_string(),
+                replace_all: false,
+            },
+        )
         .await;
         assert!(run.ok, "{}", run.for_agent);
         assert!(run.summary.contains("Replaced 1"));
@@ -666,15 +716,84 @@ mod tests {
     #[tokio::test]
     async fn edit_execute_fails_cleanly_without_writing() {
         let f = TempFile::new("noexec.txt", "aaa\n");
-        let run = execute(ToolCall::Edit {
-            path: f.path().to_string(),
-            old_string: "zzz".to_string(),
-            new_string: "yyy".to_string(),
-            replace_all: false,
-        })
+        let run = execute(
+            f.workspace(),
+            ToolCall::Edit {
+                path: f.path().to_string(),
+                old_string: "zzz".to_string(),
+                new_string: "yyy".to_string(),
+                replace_all: false,
+            },
+        )
         .await;
         assert!(!run.ok);
         assert_eq!(std::fs::read_to_string(f.path()).unwrap(), "aaa\n");
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_reads_and_writes_outside_workspace() {
+        let f = TempFile::new("boundary.txt", "inside\n");
+
+        let read_run = execute(
+            f.workspace(),
+            ToolCall::Read {
+                path: "../outside.txt".to_string(),
+            },
+        )
+        .await;
+        assert!(!read_run.ok);
+        assert!(read_run.for_agent.contains("path escapes workspace"));
+
+        let outside = f
+            .workspace()
+            .parent()
+            .unwrap()
+            .join("fra-outside-write.txt");
+        let _ = std::fs::remove_file(&outside);
+        let write_run = execute(
+            f.workspace(),
+            ToolCall::Write {
+                path: outside.to_string_lossy().into_owned(),
+                content: "must not be written".to_string(),
+            },
+        )
+        .await;
+        assert!(!write_run.ok);
+        assert!(!outside.exists());
+    }
+
+    #[tokio::test]
+    async fn execute_writes_new_files_inside_workspace() {
+        let f = TempFile::new("write-inside.txt", "seed\n");
+        let path = f
+            .workspace()
+            .join(format!("fra-new-dir-{}/nested.txt", std::process::id()));
+        let run = execute(
+            f.workspace(),
+            ToolCall::Write {
+                path: path.to_string_lossy().into_owned(),
+                content: "created\n".to_string(),
+            },
+        )
+        .await;
+        assert!(run.ok, "{}", run.for_agent);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "created\n");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn bash_starts_in_workspace() {
+        let f = TempFile::new("bash-cwd.txt", "seed\n");
+        let run = execute(
+            f.workspace(),
+            ToolCall::Bash {
+                command: "pwd".to_string(),
+            },
+        )
+        .await;
+        assert!(run.ok, "{}", run.for_agent);
+        let expected = f.workspace().canonicalize().unwrap();
+        assert_eq!(run.output.as_deref(), Some(expected.to_str().unwrap()));
     }
 
     /// Network test — run explicitly with `cargo test -- --ignored`.

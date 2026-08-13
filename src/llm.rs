@@ -455,7 +455,10 @@ mod tests {
             }
         }));
         let u = acc.finish().usage.unwrap();
-        assert_eq!((u.prompt_tokens, u.completion_tokens, u.cached_tokens), (1500, 42, 1280));
+        assert_eq!(
+            (u.prompt_tokens, u.completion_tokens, u.cached_tokens),
+            (1500, 42, 1280)
+        );
 
         // DeepSeek style: prompt_cache_hit_tokens
         let mut acc = StreamAcc::new();
@@ -537,7 +540,9 @@ mod tests {
         let cfg = Config::from_env();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let messages = vec![user_msg("Reply with exactly: OK")];
-        let turn = stream_chat(&cfg, &messages, &tx).await.expect("stream failed");
+        let turn = stream_chat(&cfg, &messages, &tx)
+            .await
+            .expect("stream failed");
         let content = turn.message["content"].as_str().unwrap_or("");
         assert!(content.contains("OK"), "content: {content}");
         assert_eq!(turn.message["role"], "assistant");
@@ -561,14 +566,18 @@ mod tests {
             system_msg(format!("You are a helpful assistant. Context: {padding}")),
             user_msg("Reply with exactly: ONE"),
         ];
-        let t1 = stream_chat(&cfg, &messages, &tx).await.expect("turn 1 failed");
+        let t1 = stream_chat(&cfg, &messages, &tx)
+            .await
+            .expect("turn 1 failed");
         let u1 = t1.usage.expect("provider did not report usage");
         assert!(u1.prompt_tokens > 1000, "padding too small: {u1:?}");
 
         // Extend with the raw message — identical prefix, new tail.
         messages.push(t1.message);
         messages.push(user_msg("Now reply with exactly: TWO"));
-        let t2 = stream_chat(&cfg, &messages, &tx).await.expect("turn 2 failed");
+        let t2 = stream_chat(&cfg, &messages, &tx)
+            .await
+            .expect("turn 2 failed");
         let u2 = t2.usage.expect("provider did not report usage");
         assert!(
             u2.cached_tokens > 0,
@@ -588,15 +597,23 @@ mod tests {
         let mut messages = vec![user_msg(
             "Read secret.txt with the read tool, then tell me the magic number it contains.",
         )];
-        let t1 = stream_chat(&cfg, &messages, &tx).await.expect("turn 1 failed");
-        assert!(!t1.tool_calls.is_empty(), "no tool call; said: {}", t1.message["content"]);
+        let t1 = stream_chat(&cfg, &messages, &tx)
+            .await
+            .expect("turn 1 failed");
+        assert!(
+            !t1.tool_calls.is_empty(),
+            "no tool call; said: {}",
+            t1.message["content"]
+        );
         let call_id = t1.tool_calls[0].id.clone();
 
         // Persist the turn exactly as the agent loop does: raw message, verbatim.
         messages.push(t1.message);
         messages.push(tool_msg(call_id, "The magic number is 4217."));
 
-        let t2 = stream_chat(&cfg, &messages, &tx).await.expect("turn 2 failed");
+        let t2 = stream_chat(&cfg, &messages, &tx)
+            .await
+            .expect("turn 2 failed");
         let content = t2.message["content"].as_str().unwrap_or("");
         assert!(
             content.contains("4217"),
@@ -614,8 +631,14 @@ mod tests {
              Call the edit tool to change it to `debug = true`. \
              Do not call any other tool and do not answer in text.",
         )];
-        let turn = stream_chat(&cfg, &messages, &tx).await.expect("stream failed");
-        assert!(!turn.tool_calls.is_empty(), "no tool call; said: {}", turn.message["content"]);
+        let turn = stream_chat(&cfg, &messages, &tx)
+            .await
+            .expect("stream failed");
+        assert!(
+            !turn.tool_calls.is_empty(),
+            "no tool call; said: {}",
+            turn.message["content"]
+        );
         let call = &turn.tool_calls[0];
         assert_eq!(call.function.name, "edit");
         let args: serde_json::Value = serde_json::from_str(&call.function.arguments).unwrap();
@@ -632,8 +655,14 @@ mod tests {
         let messages = vec![user_msg(
             "Use the read tool to read the file Cargo.toml. Do not answer in text.",
         )];
-        let turn = stream_chat(&cfg, &messages, &tx).await.expect("stream failed");
-        assert!(!turn.tool_calls.is_empty(), "model made no tool call; said: {}", turn.message["content"]);
+        let turn = stream_chat(&cfg, &messages, &tx)
+            .await
+            .expect("stream failed");
+        assert!(
+            !turn.tool_calls.is_empty(),
+            "model made no tool call; said: {}",
+            turn.message["content"]
+        );
         let call = &turn.tool_calls[0];
         assert_eq!(call.function.name, "read");
         let args: serde_json::Value = serde_json::from_str(&call.function.arguments).unwrap();

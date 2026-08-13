@@ -103,7 +103,10 @@ pub fn list_in(dir: &Path) -> Vec<Summary> {
 pub fn load(path: &Path) -> Result<SavedSession, String> {
     let mut session = read_session(path).map_err(|e| e.to_string())?;
     for item in &mut session.items {
-        if let Item::Tool(ToolRun { status, summary, .. }) = item {
+        if let Item::Tool(ToolRun {
+            status, summary, ..
+        }) = item
+        {
             if matches!(status, ToolStatus::Pending | ToolStatus::Running) {
                 *status = ToolStatus::Failed;
                 if summary.is_none() {
@@ -117,8 +120,7 @@ pub fn load(path: &Path) -> Result<SavedSession, String> {
 
 fn read_session(path: &Path) -> std::io::Result<SavedSession> {
     let data = std::fs::read_to_string(path)?;
-    serde_json::from_str(&data)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    serde_json::from_str(&data).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 #[cfg(test)]

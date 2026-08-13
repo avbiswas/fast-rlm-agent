@@ -4,12 +4,14 @@ use crossterm::event::{
     Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
     MouseEventKind,
 };
+use std::path::PathBuf;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
 use crate::agent::{self, AgentEvent};
 use crate::composer::Composer;
 use crate::config::Config;
+use crate::context::PromptContext;
 use crate::event::Event;
 use crate::session;
 use crate::snapshot::Snapshotter;
@@ -44,7 +46,11 @@ pub struct ToolRun {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum ToolBody {
     /// A file write: render a diff of `old` → `new`.
-    Diff { path: String, old: String, new: String },
+    Diff {
+        path: String,
+        old: String,
+        new: String,
+    },
     /// A command-style tool: render its captured output text (when present).
     Text { output: Option<String> },
 }
@@ -62,7 +68,9 @@ pub enum Mode {
     /// The `/resume` session picker.
     Resume(ResumePicker),
     /// The `/undo` checkpoint picker.
-    UndoPicker { cursor: usize },
+    UndoPicker {
+        cursor: usize,
+    },
 }
 
 pub struct ResumePicker {
@@ -99,11 +107,17 @@ pub struct App {
     session_created: u64,
     /// Shadow-git snapshotter for /undo. None when git is unavailable.
     pub snapshotter: Option<Snapshotter>,
+    /// Canonical directory that bounds model-requested filesystem tools.
+    workspace_root: PathBuf,
     tx: UnboundedSender<Event>,
 }
 
 impl App {
     pub fn new(tx: UnboundedSender<Event>, config: Config) -> Self {
+        let workspace_root = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from("."));
         Self {
             config,
             items: Vec::new(),
@@ -121,9 +135,8 @@ impl App {
             history: agent::new_session(),
             session_id: None,
             session_created: 0,
-            snapshotter: Snapshotter::new(
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-            ),
+            snapshotter: Snapshotter::new(workspace_root.clone()),
+            workspace_root,
             tx,
         }
     }
@@ -320,8 +333,9 @@ impl App {
         self.streaming = true;
         self.assistant_open = false;
         self.follow = true;
+        let context = PromptContext::from_prompt(prompt, &self.workspace_root);
         self.task = Some(agent::respond(
-            prompt,
+            context,
             self.config.clone(),
             self.history.clone(),
             self.tx.clone(),
@@ -410,7 +424,11 @@ impl App {
     }
 
     fn open_undo_picker(&mut self) {
-        let count = self.snapshotter.as_ref().map(|s| s.checkpoints().len()).unwrap_or(0);
+        let count = self
+            .snapshotter
+            .as_ref()
+            .map(|s| s.checkpoints().len())
+            .unwrap_or(0);
         if count == 0 {
             self.note(if self.snapshotter.is_none() {
                 "⚠ /undo not available — git not found".to_string()
@@ -425,14 +443,26 @@ impl App {
     }
 
     fn on_key_undo_picker(&mut self, key: KeyEvent) {
-        let Mode::UndoPicker { cursor } = self.mode else { return; };
-        let count = self.snapshotter.as_ref().map(|s| s.checkpoints().len()).unwrap_or(0);
+        let Mode::UndoPicker { cursor } = self.mode else {
+            return;
+        };
+        let count = self
+            .snapshotter
+            .as_ref()
+            .map(|s| s.checkpoints().len())
+            .unwrap_or(0);
 
         match key.code {
             KeyCode::Esc => self.mode = Mode::Chat,
-            KeyCode::Up => self.mode = Mode::UndoPicker { cursor: cursor.saturating_sub(1) },
+            KeyCode::Up => {
+                self.mode = Mode::UndoPicker {
+                    cursor: cursor.saturating_sub(1),
+                }
+            }
             KeyCode::Down => {
-                self.mode = Mode::UndoPicker { cursor: (cursor + 1).min(count.saturating_sub(1)) };
+                self.mode = Mode::UndoPicker {
+                    cursor: (cursor + 1).min(count.saturating_sub(1)),
+                };
             }
             KeyCode::Enter => {
                 self.mode = Mode::Chat;
@@ -446,7 +476,9 @@ impl App {
     }
 
     fn restore_to_checkpoint(&mut self, stack_idx: usize) {
-        let Some(ref mut snap) = self.snapshotter else { return; };
+        let Some(ref mut snap) = self.snapshotter else {
+            return;
+        };
         match snap.restore_to(stack_idx) {
             None => self.note("⚠ undo failed — could not restore snapshot".to_string()),
             Some(cp) => {
@@ -518,7 +550,7 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
 
-        let (verb, arg, body) = describe(&call);
+        let (verb, arg, body) = describe(&self.workspace_root, &call);
 
         // Invalid calls (e.g. an edit whose old_string isn't found) fail fast:
         // record the failure and reply to the agent without asking the user.
@@ -594,8 +626,9 @@ impl App {
     /// a `ToolUpdate` to refresh this record in the transcript.
     fn spawn_exec(&self, id: u64, call: ToolCall, responder: Responder) {
         let tx = self.tx.clone();
+        let workspace_root = self.workspace_root.clone();
         tokio::spawn(async move {
-            let run = tools::execute(call).await;
+            let run = tools::execute(&workspace_root, call).await;
             let _ = responder.send(ToolResult::Output {
                 ok: run.ok,
                 text: run.for_agent,
@@ -690,12 +723,19 @@ impl App {
 
 /// Build the transcript header bits (verb, arg, body) for a tool call.
 /// `Err` means the call is invalid and should fail without user interaction.
-fn describe(call: &ToolCall) -> (String, String, Result<ToolBody, String>) {
+fn describe(
+    workspace_root: &std::path::Path,
+    call: &ToolCall,
+) -> (String, String, Result<ToolBody, String>) {
     let text = Ok(ToolBody::Text { output: None });
     match call {
         ToolCall::Read { path } => ("Read".into(), path.clone(), text),
         ToolCall::Write { path, content } => {
-            let old = std::fs::read_to_string(path).unwrap_or_default();
+            let resolved = match crate::workspace::resolve_for_write(workspace_root, path) {
+                Ok(path) => path,
+                Err(error) => return ("Update".into(), path.clone(), Err(error)),
+            };
+            let old = std::fs::read_to_string(resolved).unwrap_or_default();
             let verb = if old.is_empty() { "Create" } else { "Update" };
             (
                 verb.into(),
@@ -713,18 +753,38 @@ fn describe(call: &ToolCall) -> (String, String, Result<ToolBody, String>) {
             new_string,
             replace_all,
         } => {
-            let body = tools::prepare_edit(path, old_string, new_string, *replace_all).map(
-                |(old, new, _)| ToolBody::Diff {
-                    path: path.clone(),
-                    old,
-                    new,
-                },
-            );
+            let body =
+                tools::prepare_edit(workspace_root, path, old_string, new_string, *replace_all)
+                    .map(|(old, new, _)| ToolBody::Diff {
+                        path: path.clone(),
+                        old,
+                        new,
+                    });
             ("Edit".into(), path.clone(), body)
         }
         ToolCall::Bash { command } => ("Bash".into(), command.clone(), text),
         ToolCall::WebSearch { query } => ("Search".into(), query.clone(), text),
         ToolCall::Fetch { url, .. } => ("Fetch".into(), url.clone(), text),
         ToolCall::AskQuestion(_) => ("Ask".into(), String::new(), text),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_preview_rejects_paths_outside_workspace() {
+        let root = std::env::temp_dir().canonicalize().unwrap();
+        let call = ToolCall::Write {
+            path: "../outside.txt".to_string(),
+            content: "must not be previewed or written".to_string(),
+        };
+
+        let (_, _, body) = describe(&root, &call);
+        let Err(error) = body else {
+            panic!("outside path unexpectedly produced an approval preview");
+        };
+        assert!(error.contains("path escapes workspace"));
     }
 }

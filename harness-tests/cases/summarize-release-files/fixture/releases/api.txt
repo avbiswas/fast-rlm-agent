@@ -1,0 +1,5 @@
+Release: Aurora 2.4
+Area: API
+Owner: Mina
+Completed: Added cursor pagination to the audit endpoint.
+Blocker: Rate-limit headers are missing from 429 responses.

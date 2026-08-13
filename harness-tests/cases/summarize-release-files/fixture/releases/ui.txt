@@ -1,0 +1,5 @@
+Release: Aurora 2.4
+Area: UI
+Owner: Priya
+Completed: Added keyboard navigation to the release picker.
+Blocker: Screen readers do not announce failed deployment status.

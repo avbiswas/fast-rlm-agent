@@ -1,0 +1,9 @@
+Read all three sources below and create rust-memory-guide.md for a Rust beginner:
+
+https://doc.rust-lang.org/book/ch04-01-what-is-ownership.html
+https://doc.rust-lang.org/book/ch04-02-references-and-borrowing.html
+https://doc.rust-lang.org/book/ch04-03-slices.html
+
+The guide must have separate sections titled Ownership, References and Borrowing,
+and Slices. Explain each idea in your own words, include at least one practical
+rule per section, and finish with a Sources section containing all three URLs.

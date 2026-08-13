@@ -27,6 +27,7 @@ use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::config::Config;
+use crate::context::PromptContext;
 use crate::event::Event;
 use crate::llm::{self, AssistantToolCall, Message};
 use crate::tools::{Choice, FetchFormat, Question, ToolCall, ToolResult};
@@ -61,13 +62,13 @@ pub enum AgentEvent {
 /// Kick off a response. Returns the task handle so the harness can `.abort()`
 /// to cancel an in-flight turn.
 pub fn respond(
-    prompt: String,
+    context: PromptContext,
     config: Config,
     history: SharedHistory,
     tx: UnboundedSender<Event>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(err) = run(prompt, &config, &history, &tx).await {
+        if let Err(err) = run(context, &config, &history, &tx).await {
             let _ = tx.send(Event::Agent(AgentEvent::Delta(format!("⚠ {err}"))));
         }
         let _ = tx.send(Event::Agent(AgentEvent::Done));
@@ -75,7 +76,7 @@ pub fn respond(
 }
 
 async fn run(
-    prompt: String,
+    context: PromptContext,
     cfg: &Config,
     history: &SharedHistory,
     tx: &UnboundedSender<Event>,
@@ -83,7 +84,7 @@ async fn run(
     // Commit the user message, then work on a local copy of the history.
     let mut messages = {
         let mut h = history.lock().unwrap();
-        h.push(llm::user_msg(prompt));
+        h.push(llm::user_msg(context.to_user_content()));
         h.clone()
     };
 
@@ -124,6 +125,9 @@ fn system_prompt() -> String {
     format!(
         "You are fast-rlm-agent, a coding agent running in a terminal harness.\n\
          Working directory: {cwd}\n\n\
+         User messages are JSON context dictionaries with `prompt`, `links`, and \
+         `files` keys. Follow `prompt`; use `links` for referenced URLs and \
+         `files` for preloaded workspace files (each has `path` and `content`).\n\n\
          Use the available tools to inspect and modify the project, run commands, \
          search the web, and fetch pages. File paths are relative to the working \
          directory. Prefer edit over write for changing existing files. \
@@ -143,7 +147,9 @@ async fn dispatch(call: &AssistantToolCall, tx: &UnboundedSender<Event>) -> Resu
     let str_arg = |key: &str| args[key].as_str().unwrap_or("").to_string();
 
     let tool_call = match call.function.name.as_str() {
-        "read" => ToolCall::Read { path: str_arg("path") },
+        "read" => ToolCall::Read {
+            path: str_arg("path"),
+        },
         "write" => ToolCall::Write {
             path: str_arg("path"),
             content: str_arg("content"),
@@ -154,8 +160,12 @@ async fn dispatch(call: &AssistantToolCall, tx: &UnboundedSender<Event>) -> Resu
             new_string: str_arg("new_string"),
             replace_all: args["replace_all"].as_bool().unwrap_or(false),
         },
-        "bash" => ToolCall::Bash { command: str_arg("command") },
-        "web_search" => ToolCall::WebSearch { query: str_arg("query") },
+        "bash" => ToolCall::Bash {
+            command: str_arg("command"),
+        },
+        "web_search" => ToolCall::WebSearch {
+            query: str_arg("query"),
+        },
         "fetch" => ToolCall::Fetch {
             url: str_arg("url"),
             format: match args["format"].as_str() {
@@ -182,7 +192,11 @@ async fn dispatch(call: &AssistantToolCall, tx: &UnboundedSender<Event>) -> Resu
             ToolCall::AskQuestion(Question {
                 header: {
                     let h = str_arg("header");
-                    if h.is_empty() { "Question".to_string() } else { h }
+                    if h.is_empty() {
+                        "Question".to_string()
+                    } else {
+                        h
+                    }
                 },
                 question: str_arg("question"),
                 multi_select: args["multi_select"].as_bool().unwrap_or(false),

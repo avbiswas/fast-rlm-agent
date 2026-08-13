@@ -1,0 +1,6 @@
+Release: Aurora 2.4
+Area: CLI
+Owner: Jules
+Completed: Added JSON output to the deploy command.
+Completed: Documented non-interactive authentication.
+Blocker: Windows paths fail when the workspace contains spaces.
