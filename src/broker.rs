@@ -95,8 +95,15 @@ enum WireCall {
         #[serde(default)]
         replace_all: bool,
     },
-    RunCommand {
+    #[serde(alias = "run_command")]
+    Bash {
         command: String,
+        #[serde(default)]
+        timeout_seconds: Option<u64>,
+    },
+    Skill {
+        #[serde(default)]
+        path: Option<String>,
     },
 }
 
@@ -116,7 +123,14 @@ impl From<WireCall> for ToolCall {
                 new_string,
                 replace_all,
             },
-            WireCall::RunCommand { command } => Self::Bash { command },
+            WireCall::Bash {
+                command,
+                timeout_seconds,
+            } => Self::Bash {
+                command,
+                timeout_seconds,
+            },
+            WireCall::Skill { path } => Self::Skill { path },
         }
     }
 }
@@ -251,5 +265,49 @@ mod tests {
             serde_json::json!({"ok": true, "text": "wrote demo.txt"})
         );
         broker.stop();
+    }
+
+    #[test]
+    fn parses_bash_and_skill_requests() {
+        let bash: Request = serde_json::from_value(serde_json::json!({
+            "token": "test",
+            "tool": "bash",
+            "command": "cargo test",
+            "timeout_seconds": 300
+        }))
+        .unwrap();
+        assert!(matches!(
+            ToolCall::from(bash.call),
+            ToolCall::Bash {
+                command,
+                timeout_seconds: Some(300)
+            } if command == "cargo test"
+        ));
+
+        let legacy: Request = serde_json::from_value(serde_json::json!({
+            "token": "test",
+            "tool": "run_command",
+            "command": "cargo test"
+        }))
+        .unwrap();
+        assert!(matches!(
+            ToolCall::from(legacy.call),
+            ToolCall::Bash {
+                command,
+                timeout_seconds: None
+            } if command == "cargo test"
+        ));
+
+        let skill: Request = serde_json::from_value(serde_json::json!({
+            "token": "test",
+            "tool": "skill",
+            "path": ".agents/skills/testing/SKILL.md"
+        }))
+        .unwrap();
+        assert!(matches!(
+            ToolCall::from(skill.call),
+            ToolCall::Skill { path: Some(path) }
+                if path == ".agents/skills/testing/SKILL.md"
+        ));
     }
 }

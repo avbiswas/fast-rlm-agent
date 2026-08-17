@@ -19,6 +19,7 @@ mod context;
 mod event;
 mod markdown;
 mod session;
+mod skills;
 mod snapshot;
 mod tools;
 mod ui;

@@ -42,12 +42,23 @@ const tools = [
     },
   },
   {
-    name: "run_command",
-    description: "Run a shell command in the workspace after user approval.",
+    name: "bash",
+    description: "Run a general Bash command in the workspace after user approval. Commands default to a 120-second timeout.",
     inputSchema: {
       type: "object",
-      properties: { command: { type: "string" } },
+      properties: {
+        command: { type: "string" },
+        timeout_seconds: { type: "integer", minimum: 1, maximum: 1800 },
+      },
       required: ["command"],
+    },
+  },
+  {
+    name: "skill",
+    description: "List workspace AGENTS.md/CLAUDE.md instructions and SKILL.md files, or read one listed document by path. Call without path to discover available documents.",
+    inputSchema: {
+      type: "object",
+      properties: { path: { type: "string" } },
     },
   },
 ];

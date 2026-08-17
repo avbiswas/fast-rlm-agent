@@ -189,7 +189,7 @@ async fn run(
         session_dir: state_root.join("rlm-sessions").display().to_string(),
         session_id,
         log_dir: state_root.join("rlm-logs").display().to_string(),
-        instruction: "You are an RLM agent powered by Fast-RLM. Act as a coding agent. Use the structured context fields directly. Use the workspace MCP tools through await mcp_call('workspace', tool_name, **arguments) to inspect and change files, and run relevant tests after edits. Mutating tools pause for user approval. Return a concise final answer in Markdown. Delegate independent read-only analysis to parallel sub-agents when useful; keep mutations in the root agent.",
+        instruction: "You are an RLM agent powered by Fast-RLM. Act as a coding agent. Use the structured context fields directly. Use the workspace MCP tools through await mcp_call('workspace', tool_name, **arguments) to inspect and change files. Before coding, call the skill tool without a path, then read any relevant AGENTS.md and SKILL.md documents it lists. Use bash for general shell commands and run relevant tests after edits. Mutating tools pause for user approval. Return a concise final answer in Markdown. Delegate independent read-only analysis to parallel sub-agents when useful; keep mutations in the root agent.",
         broker_url: broker.url(),
         broker_token: broker.token(),
         workspace_mcp_script: workspace_mcp_script.display().to_string(),
@@ -409,6 +409,102 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(workspace.join("proof.txt")).unwrap(),
             "FAST_RLM_EDIT_WORKS\n"
+        );
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a configured live model and spends provider credits"]
+    async fn live_fast_rlm_can_run_bash() {
+        const COMMAND: &str = "printf FAST_RLM_BASH_OK";
+
+        let workspace =
+            std::env::temp_dir().join(format!("fast-rlm-agent-live-bash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let prompt = format!(
+            "Use the workspace MCP bash tool exactly once with command `{COMMAND}`. \
+             Do not use read_file, write_file, or edit_file. The MCP result is an object \
+             with a text field; report that text in your final answer."
+        );
+        let context = PromptContext::from_prompt(prompt, &workspace);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let task = respond(
+            context,
+            Config::from_env(),
+            new_session(),
+            workspace.clone(),
+            format!("live-bash-{}", std::process::id()),
+            tx,
+        );
+        let mut saw_expected_bash = false;
+        let mut final_reported_marker = false;
+
+        tokio::time::timeout(std::time::Duration::from_secs(300), async {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    Event::Agent(AgentEvent::Tool(call @ ToolCall::Skill { .. }, responder)) => {
+                        let run = crate::tools::execute(&workspace, call).await;
+                        let _ = responder.send(crate::tools::ToolResult::Output {
+                            ok: run.ok,
+                            text: run.for_agent,
+                        });
+                    }
+                    Event::Agent(AgentEvent::Tool(
+                        ToolCall::Bash {
+                            command,
+                            timeout_seconds,
+                        },
+                        responder,
+                    )) => {
+                        if command == COMMAND {
+                            let run = crate::tools::execute(
+                                &workspace,
+                                ToolCall::Bash {
+                                    command,
+                                    timeout_seconds,
+                                },
+                            )
+                            .await;
+                            saw_expected_bash =
+                                run.ok && run.for_agent.contains("FAST_RLM_BASH_OK");
+                            let _ = responder.send(crate::tools::ToolResult::Output {
+                                ok: run.ok,
+                                text: run.for_agent,
+                            });
+                        } else {
+                            let _ = responder.send(crate::tools::ToolResult::Output {
+                                ok: false,
+                                text: "unexpected Bash command rejected by live test".to_string(),
+                            });
+                        }
+                    }
+                    Event::Agent(AgentEvent::Tool(_, responder)) => {
+                        let _ = responder.send(crate::tools::ToolResult::Output {
+                            ok: false,
+                            text: "unexpected tool call rejected by live Bash test".to_string(),
+                        });
+                    }
+                    Event::Agent(AgentEvent::Final { depth: 0, result }) => {
+                        final_reported_marker = result.to_string().contains("FAST_RLM_BASH_OK");
+                    }
+                    Event::Agent(AgentEvent::Done) => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("live FastRLM Bash test timed out");
+        task.await.unwrap();
+
+        assert!(
+            saw_expected_bash,
+            "FastRLM did not execute the expected Bash command"
+        );
+        assert!(
+            final_reported_marker,
+            "FastRLM did not report the Bash output in its final answer"
         );
         let _ = std::fs::remove_dir_all(workspace);
     }

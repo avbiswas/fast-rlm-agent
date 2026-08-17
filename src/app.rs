@@ -819,7 +819,12 @@ fn describe(
                     });
             ("Edit".into(), path.clone(), body)
         }
-        ToolCall::Bash { command } => ("Bash".into(), command.clone(), text),
+        ToolCall::Bash { command, .. } => ("Bash".into(), command.clone(), text),
+        ToolCall::Skill { path } => (
+            "Skill".into(),
+            path.clone().unwrap_or_else(|| "list".to_string()),
+            text,
+        ),
         ToolCall::WebSearch { query } => ("Search".into(), query.clone(), text),
         ToolCall::Fetch { url, .. } => ("Fetch".into(), url.clone(), text),
         ToolCall::AskQuestion(_) => ("Ask".into(), String::new(), text),

@@ -11,7 +11,8 @@ the run happens.
 - Recursive sub-agent execution with generated Python and captured output
 - Structured dictionary input with `prompt`, `links`, and `files`
 - A bounded `fetch_url` REPL tool for external sources
-- Reviewed workspace read, write, exact-edit, and shell tools over MCP
+- Reviewed workspace read, write, exact-edit, and general Bash tools over MCP
+- On-demand discovery and reading of workspace `AGENTS.md` and `SKILL.md` files
 - Diff previews and explicit approval before mutations or commands
 - Persistent FastRLM REPL memory across follow-up turns and `/resume`
 - Syntax-highlighted Python with compact output and error previews
@@ -89,9 +90,20 @@ Files can be referenced as ordinary paths, backtick paths, `@paths`, or local
 Markdown links. Missing, binary, and out-of-workspace files are not loaded.
 Links remain structured strings; FastRLM can retrieve them through `fetch_url`.
 
+The workspace MCP server also exposes a read-only `skill` tool. Calling it
+without a path lists instruction and skill documents in the workspace; calling
+it again with a listed path reads that document. Build directories and VCS
+metadata are skipped during discovery. The agent is instructed to consult
+relevant `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, and `SKILL.md` files
+before coding.
+
+The `bash` tool runs non-login Bash in the startup workspace after approval.
+It defaults to a 120-second timeout, accepts explicit timeouts up to 30 minutes,
+and bounds returned output to the last 2,000 lines or 50 KiB.
+
 ## Current limitations
 
-FastRLM can now read, write, and edit workspace files and run commands through
+FastRLM can now read, write, and edit workspace files and run Bash commands through
 the Rust approval boundary. Directory listing, globbing, text search, patch
 editing, process-group cancellation, and rewinding FastRLM's REPL state during
 `/undo` remain on the roadmap.

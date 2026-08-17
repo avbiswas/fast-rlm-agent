@@ -9,6 +9,7 @@
 //! tool = a new `ToolCall` variant + an arm in `execute`.
 
 use std::path::Path;
+use std::time::Duration;
 
 use tokio::sync::oneshot;
 
@@ -30,8 +31,13 @@ pub enum ToolCall {
         new_string: String,
         replace_all: bool,
     },
-    /// Run a shell command. Gated behind approval; shows its output.
-    Bash { command: String },
+    /// Run a Bash command. Gated behind approval; shows its output.
+    Bash {
+        command: String,
+        timeout_seconds: Option<u64>,
+    },
+    /// Discover or read workspace instruction and skill documents.
+    Skill { path: Option<String> },
     /// Search the web via the Exa API. Shows results.
     WebSearch { query: String },
     /// Fetch a URL and return its content. HTML is converted per `format` —
@@ -138,7 +144,11 @@ pub async fn execute(workspace_root: &Path, call: ToolCall) -> Run {
             new_string,
             replace_all,
         } => edit(workspace_root, path, old_string, new_string, replace_all).await,
-        ToolCall::Bash { command } => bash(workspace_root, command).await,
+        ToolCall::Bash {
+            command,
+            timeout_seconds,
+        } => bash(workspace_root, command, timeout_seconds).await,
+        ToolCall::Skill { path } => skill(workspace_root, path).await,
         ToolCall::WebSearch { query } => web_search(query).await,
         ToolCall::Fetch { url, format } => fetch(url, format).await,
         // Questions are resolved by the UI, never executed here.
@@ -284,20 +294,36 @@ async fn edit(
     }
 }
 
-async fn bash(workspace_root: &Path, command: String) -> Run {
-    let result = tokio::process::Command::new("sh")
+const DEFAULT_BASH_TIMEOUT_SECONDS: u64 = 120;
+const MAX_BASH_TIMEOUT_SECONDS: u64 = 1800;
+const MAX_BASH_OUTPUT_BYTES: usize = 50 * 1024;
+const MAX_BASH_OUTPUT_LINES: usize = 2000;
+
+async fn bash(workspace_root: &Path, command: String, timeout_seconds: Option<u64>) -> Run {
+    let timeout_seconds = timeout_seconds.unwrap_or(DEFAULT_BASH_TIMEOUT_SECONDS);
+    if !(1..=MAX_BASH_TIMEOUT_SECONDS).contains(&timeout_seconds) {
+        return Run {
+            ok: false,
+            for_agent: format!("timeout_seconds must be between 1 and {MAX_BASH_TIMEOUT_SECONDS}"),
+            summary: "invalid timeout".to_string(),
+            output: None,
+        };
+    }
+
+    let mut process = tokio::process::Command::new("bash");
+    process
         .arg("-c")
         .arg(&command)
         .current_dir(workspace_root)
-        .output()
-        .await;
+        .kill_on_drop(true);
+    let result = tokio::time::timeout(Duration::from_secs(timeout_seconds), process.output()).await;
 
     match result {
-        Ok(out) => {
+        Ok(Ok(out)) => {
             let mut body = String::new();
             body.push_str(&String::from_utf8_lossy(&out.stdout));
             body.push_str(&String::from_utf8_lossy(&out.stderr));
-            let body = body.trim_end().to_string();
+            let body = truncate_bash_output(body.trim_end());
             let code = out.status.code().unwrap_or(-1);
             Run {
                 ok: out.status.success(),
@@ -310,12 +336,67 @@ async fn bash(workspace_root: &Path, command: String) -> Run {
                 }),
             }
         }
-        Err(e) => Run {
+        Ok(Err(e)) => Run {
             ok: false,
             for_agent: format!("failed to run `{command}`: {e}"),
             summary: format!("error: {e}"),
             output: Some(e.to_string()),
         },
+        Err(_) => Run {
+            ok: false,
+            for_agent: format!("$ {command}\n(command timed out after {timeout_seconds}s)"),
+            summary: format!("timed out after {timeout_seconds}s"),
+            output: Some(format!("command timed out after {timeout_seconds}s")),
+        },
+    }
+}
+
+async fn skill(workspace_root: &Path, path: Option<String>) -> Run {
+    let result = match path {
+        Some(path) => crate::skills::read(workspace_root, &path)
+            .map(|content| (content, format!("Read {path}"))),
+        None => crate::skills::list(workspace_root)
+            .map(|content| (content, "Listed instructions and skills".to_string())),
+    };
+    match result {
+        Ok((content, summary)) => Run {
+            ok: true,
+            for_agent: content,
+            summary,
+            output: None,
+        },
+        Err(error) => Run {
+            ok: false,
+            for_agent: format!("ERROR: {error}"),
+            summary: error,
+            output: None,
+        },
+    }
+}
+
+fn truncate_bash_output(output: &str) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    let line_start = lines.len().saturating_sub(MAX_BASH_OUTPUT_LINES);
+    let mut kept = lines[line_start..].join("\n");
+    let mut truncated = line_start > 0;
+
+    if kept.len() > MAX_BASH_OUTPUT_BYTES {
+        let mut start = kept.len() - MAX_BASH_OUTPUT_BYTES;
+        while !kept.is_char_boundary(start) {
+            start += 1;
+        }
+        kept = kept[start..].to_string();
+        truncated = true;
+    }
+
+    if truncated {
+        format!(
+            "[Output truncated; showing the last {} lines / {} bytes]\n{kept}",
+            kept.lines().count(),
+            kept.len()
+        )
+    } else {
+        kept
     }
 }
 
@@ -792,13 +873,56 @@ mod tests {
         let run = execute(
             f.workspace(),
             ToolCall::Bash {
-                command: "pwd".to_string(),
+                command: "printf '%s\\n' \"$PWD\"; test -n \"$BASH_VERSION\"".to_string(),
+                timeout_seconds: None,
             },
         )
         .await;
         assert!(run.ok, "{}", run.for_agent);
         let expected = f.workspace().canonicalize().unwrap();
         assert_eq!(run.output.as_deref(), Some(expected.to_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn bash_rejects_invalid_timeout() {
+        let f = TempFile::new("bash-timeout.txt", "seed\n");
+        let run = execute(
+            f.workspace(),
+            ToolCall::Bash {
+                command: "pwd".to_string(),
+                timeout_seconds: Some(0),
+            },
+        )
+        .await;
+        assert!(!run.ok);
+        assert_eq!(run.summary, "invalid timeout");
+    }
+
+    #[tokio::test]
+    async fn bash_enforces_timeout() {
+        let f = TempFile::new("bash-enforces-timeout.txt", "seed\n");
+        let run = execute(
+            f.workspace(),
+            ToolCall::Bash {
+                command: "sleep 5".to_string(),
+                timeout_seconds: Some(1),
+            },
+        )
+        .await;
+        assert!(!run.ok);
+        assert_eq!(run.summary, "timed out after 1s");
+    }
+
+    #[test]
+    fn bash_output_keeps_the_tail_and_reports_truncation() {
+        let output = (0..=MAX_BASH_OUTPUT_LINES)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let truncated = truncate_bash_output(&output);
+        assert!(truncated.starts_with("[Output truncated;"));
+        assert!(!truncated.contains("line 0\n"));
+        assert!(truncated.ends_with(&format!("line {MAX_BASH_OUTPUT_LINES}")));
     }
 
     /// Network test — run explicitly with `cargo test -- --ignored`.
