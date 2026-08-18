@@ -67,6 +67,13 @@ impl Events {
         Self { rx, tx }
     }
 
+    /// Headless variant: no terminal reader and no render tick, so the loop
+    /// only wakes for agent and tool events.
+    pub fn new_headless() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        Self { rx, tx }
+    }
+
     pub async fn next(&mut self) -> Option<Event> {
         self.rx.recv().await
     }

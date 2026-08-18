@@ -45,6 +45,12 @@ def run_request(
         "max_depth": request.get("max_depth", 3),
         "max_calls_per_subagent": request.get("max_calls", 20),
         "max_money_spent": request.get("max_money_spent", 0.2),
+        # Sub-agents inherit the workspace MCP server (and any Python tools)
+        # instead of starting blind. Every mutating workspace tool is still
+        # approval-gated per call, so inheritance widens what a sub-agent can
+        # *see*, not what it can do unreviewed.
+        "inherit_mcp": request.get("inherit_mcp", True),
+        "inherit_tools": request.get("inherit_tools", True),
     }
 
     def on_step(event: dict[str, Any]) -> None:

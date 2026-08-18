@@ -1,2 +1,3 @@
-# Latest FastRLM main at integration time (2026-08-13).
-fast-rlm @ git+https://github.com/avbiswas/fast-rlm.git@f25f310be9832c9a914744fbf7116c715b84eeeb
+# FastRLM 0.4.2 — first release with the sub-agent capability-inheritance flags
+# (inherit_mcp / inherit_tools) the harness relies on.
+fast-rlm==0.4.2

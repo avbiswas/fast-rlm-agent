@@ -8,7 +8,7 @@ const encoder = new TextEncoder();
 const tools = [
   {
     name: "read_file",
-    description: "Read a UTF-8 file inside the harness workspace. Read-only.",
+    description: "Read a UTF-8 file from the real project workspace on the host. Read-only. This is the ONLY way to see workspace files: your Python REPL runs in a separate sandbox with its own empty filesystem.",
     inputSchema: {
       type: "object",
       properties: { path: { type: "string" } },
@@ -17,7 +17,7 @@ const tools = [
   },
   {
     name: "write_file",
-    description: "Create or overwrite a workspace file after user approval.",
+    description: "Create or overwrite a file in the real project workspace on the host, after user approval. Writing with Python open() instead only writes to the REPL sandbox and does NOT touch the project.",
     inputSchema: {
       type: "object",
       properties: {
@@ -29,7 +29,7 @@ const tools = [
   },
   {
     name: "edit_file",
-    description: "Replace exact text in a workspace file after user approval.",
+    description: "Replace exact text in a real workspace file after user approval. If old_string is not found or is ambiguous, the tool returns an explanatory message you can act on — it does not raise.",
     inputSchema: {
       type: "object",
       properties: {
@@ -43,7 +43,7 @@ const tools = [
   },
   {
     name: "bash",
-    description: "Run a general Bash command in the workspace after user approval. Commands default to a 120-second timeout.",
+    description: "Run a general Bash command in the real project workspace after user approval. Commands default to a 120-second timeout. A non-zero exit is returned normally as text ending in \"(exit N)\" — it is NOT an exception, so you can inspect it and continue in the same REPL cell.",
     inputSchema: {
       type: "object",
       properties: {
@@ -64,16 +64,35 @@ const tools = [
 ];
 
 async function callTool(name: string, args: Record<string, unknown>) {
-  const response = await fetch(brokerUrl, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ token: brokerToken, tool: name, ...args }),
-  });
-  const result = await response.json();
+  let result: { ok?: boolean; is_error?: boolean; text?: string };
+  try {
+    const response = await fetch(brokerUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: brokerToken, tool: name, ...args }),
+    });
+    result = await response.json();
+  } catch (error) {
+    // Never let a broker failure escape: an exception here would unwind the
+    // stdio loop and kill this server, so every later tool call in the run
+    // would fail with "Connection closed" instead of just this one.
+    const detail = error instanceof Error ? error.message : String(error);
+    result = { ok: false, is_error: true, text: `workspace tool '${name}' failed: ${detail}` };
+  }
+  // Deliberately no `structuredContent`: FastRLM's mcp_call returns it in
+  // preference to the text, so exposing {ok, is_error, text} would make
+  // read_file hand back a dict instead of the file's contents. Agents then
+  // slice or splitlines() it and get the dict's repr — observed at both the
+  // root and sub-agent level. `ok` is already legible in the text (bash ends
+  // in "(exit N)", failures start with "ERROR:"), and isError below is a
+  // separate top-level MCP field, so nothing is lost by omitting it.
   return {
     content: [{ type: "text", text: result.text }],
-    structuredContent: result,
-    isError: !result.ok,
+    // Only transport/protocol failures raise in the agent's REPL. A tool that
+    // ran and returned a message the model can act on (non-zero exit, missing
+    // file, unmatched old_string) comes back as a normal result, so a single
+    // recoverable failure no longer discards the rest of the REPL cell.
+    isError: result.is_error === true,
   };
 }
 
@@ -107,6 +126,13 @@ for await (const chunk of Deno.stdin.readable.pipeThrough(new TextDecoderStream(
   while ((newline = pending.indexOf("\n")) >= 0) {
     const line = pending.slice(0, newline).trim();
     pending = pending.slice(newline + 1);
-    if (line) await respond(JSON.parse(line));
+    if (!line) continue;
+    // Same reasoning as callTool: a malformed line or a failed respond() must
+    // not tear down the server and take every remaining tool call with it.
+    try {
+      await respond(JSON.parse(line));
+    } catch (error) {
+      console.error(`workspace mcp: dropped a bad message: ${error}`);
+    }
   }
 }

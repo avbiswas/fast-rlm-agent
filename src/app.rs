@@ -110,6 +110,8 @@ pub struct App {
     session_created: u64,
     /// Shadow-git snapshotter for /undo. None when git is unavailable.
     pub snapshotter: Option<Snapshotter>,
+    /// Approve mutating tools without asking. Set only by `--headless`.
+    pub auto_approve: bool,
     /// Canonical directory that bounds model-requested filesystem tools.
     workspace_root: PathBuf,
     tx: UnboundedSender<Event>,
@@ -140,6 +142,7 @@ impl App {
             session_id: None,
             session_created: 0,
             snapshotter: Snapshotter::new(workspace_root.clone()),
+            auto_approve: false,
             workspace_root,
             tx,
         }
@@ -297,6 +300,13 @@ impl App {
     }
 
     // ---- chat actions ----------------------------------------------------
+
+    /// Submit `text` as if the user had typed it. Used by headless runs.
+    pub fn submit_text(&mut self, text: &str) {
+        self.composer.clear();
+        self.composer.insert_str(text);
+        self.submit();
+    }
 
     fn submit(&mut self) {
         if self.streaming || self.composer.is_empty() {
@@ -615,7 +625,7 @@ impl App {
             }
         };
 
-        let needs_approval = call.needs_approval();
+        let needs_approval = call.needs_approval() && !self.auto_approve;
         let status = if needs_approval {
             ToolStatus::Pending
         } else {

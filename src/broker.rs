@@ -16,6 +16,10 @@ use crate::tools::{ToolCall, ToolResult};
 
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 
+/// Tool names `WireCall` accepts, echoed back when a call cannot be parsed so
+/// the agent can correct itself instead of guessing.
+const KNOWN_TOOLS: [&str; 5] = ["read_file", "write_file", "edit_file", "bash", "skill"];
+
 pub struct Broker {
     url: String,
     token: String,
@@ -141,9 +145,22 @@ async fn handle(
     tx: UnboundedSender<Event>,
 ) -> Result<(), String> {
     let body = read_http_body(&mut stream).await?;
-    let request: Request = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+    // A request we cannot parse — most often a tool name that does not exist —
+    // must still get a reply. Dropping the connection instead propagates as
+    // "MCP error -32000: Connection closed", which kills the MCP server process
+    // for the rest of the run rather than failing the one bad call.
+    let request: Request = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            let names = KNOWN_TOOLS.join(", ");
+            let text = format!(
+                "could not handle this workspace tool call ({error}); valid tools: {names}"
+            );
+            return write_json(&mut stream, 400, false, false, &text).await;
+        }
+    };
     if request.token != expected_token {
-        return write_json(&mut stream, 403, false, "invalid broker token").await;
+        return write_json(&mut stream, 403, false, true, "invalid broker token").await;
     }
 
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -154,11 +171,12 @@ async fn handle(
     .map_err(|_| "application event loop closed".to_string())?;
 
     match reply_rx.await {
-        Ok(ToolResult::Output { ok, text }) => write_json(&mut stream, 200, ok, &text).await,
+        // The tool ran: hand the model its result, never an exception.
+        Ok(ToolResult::Output { ok, text }) => write_json(&mut stream, 200, ok, false, &text).await,
         Ok(ToolResult::Question { .. }) => {
-            write_json(&mut stream, 500, false, "unexpected question result").await
+            write_json(&mut stream, 500, false, true, "unexpected question result").await
         }
-        Err(_) => write_json(&mut stream, 503, false, "tool request cancelled").await,
+        Err(_) => write_json(&mut stream, 503, false, true, "tool request cancelled").await,
     }
 }
 
@@ -205,14 +223,23 @@ async fn read_http_body(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
     Ok(data[header_end..header_end + length].to_vec())
 }
 
+/// `ok` is the *display* signal: it drives the transcript's Done/Failed marker.
+/// `is_error` is the *control* signal: the MCP server maps it to `isError`, and
+/// FastRLM turns that into a Python exception that aborts the agent's entire
+/// REPL cell. A tool that ran and produced a message the model can act on —
+/// a non-zero exit code, a missing file, an `old_string` that didn't match —
+/// is a normal result, not an error. Only failures that leave the model with
+/// nothing to act on (bad token, cancelled turn, protocol violation) raise.
 async fn write_json(
     stream: &mut TcpStream,
     status: u16,
     ok: bool,
+    is_error: bool,
     text: &str,
 ) -> Result<(), String> {
-    let body = serde_json::to_vec(&serde_json::json!({ "ok": ok, "text": text }))
-        .map_err(|e| e.to_string())?;
+    let body =
+        serde_json::to_vec(&serde_json::json!({ "ok": ok, "is_error": is_error, "text": text }))
+            .map_err(|e| e.to_string())?;
     let reason = if status == 200 { "OK" } else { "Error" };
     let header = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -262,7 +289,39 @@ mod tests {
         let body: serde_json::Value = response.json().await.unwrap();
         assert_eq!(
             body,
-            serde_json::json!({"ok": true, "text": "wrote demo.txt"})
+            serde_json::json!({"ok": true, "is_error": false, "text": "wrote demo.txt"})
+        );
+        broker.stop();
+    }
+
+    /// An unknown tool name must come back as a normal 400 reply. Dropping the
+    /// connection instead surfaces to the agent as "MCP error -32000: Connection
+    /// closed" and kills the MCP server process, so every later workspace call
+    /// in the run fails too — one typo costs the whole turn.
+    #[tokio::test]
+    async fn unknown_tool_gets_a_reply_instead_of_a_dropped_connection() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let broker = Broker::start(tx).await.unwrap();
+        let response = reqwest::Client::new()
+            .post(broker.url())
+            .json(&serde_json::json!({
+                "token": broker.token(),
+                "tool": "list_dir",
+                "path": "/"
+            }))
+            .send()
+            .await
+            .expect("broker must answer an unknown tool, not hang up");
+
+        assert_eq!(response.status().as_u16(), 400);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["ok"], serde_json::json!(false));
+        // Recoverable: the agent should correct the name, not have its cell killed.
+        assert_eq!(body["is_error"], serde_json::json!(false));
+        let text = body["text"].as_str().unwrap();
+        assert!(
+            text.contains("read_file"),
+            "should list valid tools: {text}"
         );
         broker.stop();
     }

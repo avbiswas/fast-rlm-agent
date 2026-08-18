@@ -47,6 +47,24 @@ const LIVE_VIEWPORT_HEIGHT: u16 = 12;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `--headless <prompt>` runs exactly one turn with no TUI, printing the
+    // transcript to stdout. It auto-approves mutating tools, so it is gated
+    // behind an explicit second flag and meant for tests in scratch
+    // workspaces — never for a directory you care about.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(index) = args.iter().position(|a| a == "--headless") {
+        let Some(prompt) = args.get(index + 1) else {
+            anyhow::bail!("--headless requires a prompt argument");
+        };
+        if !args.iter().any(|a| a == "--dangerously-auto-approve") {
+            anyhow::bail!(
+                "--headless auto-approves writes and shell commands; \
+                 pass --dangerously-auto-approve to confirm"
+            );
+        }
+        return run_headless(prompt.clone()).await;
+    }
+
     install_panic_hook();
     let mut terminal = init_terminal()?;
 
@@ -55,6 +73,35 @@ async fn main() -> Result<()> {
     // Always restore the terminal, even if `run` errored.
     restore_terminal()?;
     result
+}
+
+async fn run_headless(prompt: String) -> Result<()> {
+    let mut events = Events::new_headless();
+    let mut app = App::new(events.tx.clone(), config::Config::from_env());
+    app.auto_approve = true;
+    app.submit_text(&prompt);
+
+    let mut printed = 0;
+    while let Some(event) = events.next().await {
+        let finished = matches!(event, Event::Agent(agent::AgentEvent::Done));
+        if !matches!(event, Event::Tick) {
+            app.update(event);
+        }
+
+        // Stream newly settled transcript items as plain text.
+        while printed < app.items.len() {
+            print!("{}", ui::render_items(&app.items[printed..printed + 1]));
+            printed += 1;
+        }
+        use std::io::Write;
+        io::stdout().flush()?;
+
+        if finished || app.should_quit {
+            break;
+        }
+    }
+    app.save_session();
+    Ok(())
 }
 
 async fn run(terminal: &mut Tui) -> Result<()> {

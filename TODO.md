@@ -37,6 +37,8 @@ a dependable coding harness. Items are roughly ordered by risk and dependency.
   fields compatible with FastRLM dictionary input.
 - [x] Bridge reviewed host read, write, exact-edit, and shell tools into FastRLM.
 - [ ] Bridge structured user questions into FastRLM.
+- [x] Grant sub-agents workspace MCP access by default, via the FastRLM
+  `inherit_mcp` / `inherit_tools` config flags (FastRLM 0.4.2).
 - [ ] Make `/undo` restore FastRLM REPL state as well as files and transcript.
 - [ ] Estimate context usage before each request and show remaining capacity.
 - [ ] Compact old conversation history at explicit checkpoints while retaining
@@ -85,7 +87,7 @@ a dependable coding harness. Items are roughly ordered by risk and dependency.
 - [ ] Add directory listing, glob, and text-search tools.
 - [ ] Add a patch-based editing tool for changes that do not fit exact-string
   replacement.
-- [ ] Add non-interactive/headless operation.
+- [x] Add non-interactive/headless operation (`--headless`).
 - [ ] Add structured diagnostic logging and an opt-in debug view.
 - [ ] Add packaging, release, and installation workflows.
 - [x] Keep the project clean under `cargo fmt`, `cargo test`, and strict Clippy.

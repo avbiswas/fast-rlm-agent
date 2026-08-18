@@ -19,6 +19,54 @@ use crate::context::PromptContext;
 use crate::event::Event;
 use crate::tools::{Responder, ToolCall};
 
+/// System instruction appended to every agent's prompt.
+///
+/// Two rules here exist because of concrete failures observed in run logs:
+///
+/// * The REPL is a Pyodide sandbox with its own empty filesystem. Models
+///   assume `open()` and `os.listdir` see the project, write the artifact into
+///   the sandbox, then shell out to verify it and find nothing there.
+/// * Sub-agents inherit no MCP access (FastRLM grants servers per call). A
+///   parent that delegates "review this file" with only a *path* hands the
+///   child a name it has no way to resolve — and the child, unable to admit
+///   it, fabricates a review of a file it never read.
+const INSTRUCTION: &str = concat!(
+    "You are an RLM agent powered by Fast-RLM. Act as a coding agent. ",
+    "Use the structured context fields directly. ",
+    "Use the workspace MCP tools through await mcp_call('workspace', tool_name, **arguments) ",
+    "to inspect and change files. ",
+    "Before coding, call the skill tool without a path, then read any relevant AGENTS.md and ",
+    "SKILL.md documents it lists. ",
+    "Use bash for general shell commands and run relevant tests after edits. ",
+    "Mutating tools pause for user approval. ",
+    "Return a concise final answer in Markdown.\n\n",
+    "FILESYSTEM: your Python REPL runs in an isolated Pyodide sandbox with its own empty ",
+    "filesystem. It is NOT the project directory. open(), pathlib, os.listdir and os.getcwd ",
+    "all operate on that sandbox, so a file you write with open() does not exist in the ",
+    "project and bash will not find it. The only way to touch project files is ",
+    "mcp_call('workspace', ...). Build content in REPL variables, then persist it with ",
+    "write_file or edit_file.\n\n",
+    "TOOL RESULTS: workspace tools return their outcome as text instead of raising. A bash ",
+    "command that exits non-zero comes back as normal output ending in '(exit N)'; a failed ",
+    "edit comes back as an explanatory message. Check the returned text and adapt — do not ",
+    "wrap every call in try/except, and do not assume a cell died because one command failed.\n\n",
+    "SUB-AGENTS: a sub-agent starts with none of your variables and sees ONLY the context you ",
+    "pass, but it does inherit the workspace MCP tools, so it can read and search the project ",
+    "itself. Therefore:\n",
+    "- Prefer passing a file's CONTENTS as data when you already have them in a variable: ",
+    "await llm_query({\"source\": src}, instruction=\"...\"). It saves the child a round trip.\n",
+    "- A sub-agent can also call mcp_call('workspace', ...) on its own. Pass mcp=[] if you want ",
+    "a child to have no workspace access at all.\n",
+    "- If a sub-agent reports that it could not find or read something, treat its conclusions ",
+    "as void and redo the work yourself. Never repeat a sub-agent's findings as fact when it ",
+    "had no access to the material.\n\n",
+    "VERIFICATION: before describing what you built, re-read the file you actually wrote with ",
+    "read_file and base your claims on that text. Do not describe behaviour from a local ",
+    "reimplementation, from the draft in a variable, or from a sub-agent that could not read ",
+    "the file. Delegate independent read-only analysis to parallel sub-agents when useful; ",
+    "keep mutations in the root agent."
+);
+
 const BRIDGE_SOURCE: &str = include_str!("../scripts/fast_rlm_bridge.py");
 const WORKSPACE_MCP_SOURCE: &str = include_str!("../scripts/workspace_mcp.ts");
 
@@ -89,6 +137,10 @@ struct BridgeRequest<'a> {
     broker_url: &'a str,
     broker_token: &'a str,
     workspace_mcp_script: String,
+    /// Let sub-agents reach the workspace MCP server without an explicit
+    /// per-call grant. Mutating tools stay approval-gated either way.
+    inherit_mcp: bool,
+    inherit_tools: bool,
 }
 
 #[derive(Deserialize)]
@@ -189,7 +241,9 @@ async fn run(
         session_dir: state_root.join("rlm-sessions").display().to_string(),
         session_id,
         log_dir: state_root.join("rlm-logs").display().to_string(),
-        instruction: "You are an RLM agent powered by Fast-RLM. Act as a coding agent. Use the structured context fields directly. Use the workspace MCP tools through await mcp_call('workspace', tool_name, **arguments) to inspect and change files. Before coding, call the skill tool without a path, then read any relevant AGENTS.md and SKILL.md documents it lists. Use bash for general shell commands and run relevant tests after edits. Mutating tools pause for user approval. Return a concise final answer in Markdown. Delegate independent read-only analysis to parallel sub-agents when useful; keep mutations in the root agent.",
+        instruction: INSTRUCTION,
+        inherit_mcp: true,
+        inherit_tools: true,
         broker_url: broker.url(),
         broker_token: broker.token(),
         workspace_mcp_script: workspace_mcp_script.display().to_string(),

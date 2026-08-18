@@ -22,8 +22,8 @@ the run happens.
 ## Setup
 
 You need a recent Rust toolchain, Python 3.10+, Deno 2+, `uv`, and an
-OpenAI-compatible model API. FastRLM is pinned to the latest tested GitHub
-revision in `requirements-fast-rlm.txt`.
+OpenAI-compatible model API. FastRLM is pinned to a tested release in
+`requirements-fast-rlm.txt`.
 
 Clone or download this repository, then enter its directory:
 
@@ -70,6 +70,27 @@ cargo run
 
 Chat sessions, FastRLM REPL state, run logs, and undo snapshots are stored under
 `~/.fast-rlm-agent/`.
+
+## Headless runs
+
+A single turn can be run without the TUI, printing the transcript to stdout:
+
+```sh
+fast-rlm-agent --headless "your prompt" --dangerously-auto-approve
+```
+
+This approves every write and shell command without asking, so run it only in a
+scratch workspace. It is intended for reproducing traces and for end-to-end
+tests, not for normal use.
+
+## Tool result semantics
+
+Workspace tools report their outcome as text rather than raising in the agent's
+REPL. A Bash command that exits non-zero comes back as normal output ending in
+`(exit N)`; a failed `edit_file` comes back as an explanatory message. Only
+transport-level failures (bad broker token, cancelled turn) raise, because a
+raised error aborts the agent's entire REPL cell and discards all the work in
+it. The transcript still marks such calls as failed.
 
 Before each model turn, the harness extracts HTTP(S) URLs and referenced UTF-8
 workspace files from the prompt. The model receives a structured context object:
